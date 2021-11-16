@@ -1,0 +1,238 @@
+<?php
+/** pahooCache.php
+ * キャッシュ処理に関わるクラス
+ *   インターネットのコンテンツをキャッシングする．
+ *
+ * @copyright	(c)studio pahoo
+ * @author		パパぱふぅ
+ * @動作環境	PHP 5/7/8
+ * @参考URL		https://www.pahoo.org/e-soul/webtech/php06/php06-72-01.shtm
+*/
+
+//pahooCacheクラス ========================================================
+class pahooCache {
+	const LIFE_CACHE = (2 * 60);		//キャッシュ保持時間（デフォルト；分）
+	const DEF_DIRCACHE = './pcache/';	//キャッシュ・ディレクトリ（デフォルト）
+
+	var $lifeCache;			//キャッシュ保持時間（分）（0：キャッシュしない）
+	var $dirCache;			//キャッシュ用ディレクトリ
+	var $error;				//エラーフラグ
+	var $errmsg;			//エラーメッセージ
+	var $debug;				//デバッグ用ファイル名
+
+/**
+ * コンストラクタ
+ * @param	int    $life キャッシュ保持時間（分）（省略可能）
+ * @param	string $dir キャッシュ・ディレクトリ（省略可能）
+ * @return	なし
+*/
+function __construct($life=self::LIFE_CACHE, $dir=self::DEF_DIRCACHE) {
+	if ($life < 0) {
+		$life = 0;
+	}
+	if (preg_match('/\/$/ui', $dir) == 0) {
+		$dir = $dir . '/';
+	}
+	$this->error      = FALSE;
+	$this->errmsg     = '';
+	$this->debug      = '';
+	$this->lifeCache = $life;
+	$this->dirCache  = $dir;
+
+	//PHPバージョンチェック
+	if (! isphp5over()) {
+		$this->error   = TRUE;
+		$this->errmsg  = '動作にはPHP5以上が必要です';
+		return;
+	}
+
+	//キャッシュ・ディレクトリが無ければ作成
+	if (! is_dir($this->dirCache)) {
+		$res = mkdir($this->dirCache, 0744);
+		if ($res == FALSE) {
+			$this->error   = TRUE;
+			$this->errmsg  = 'キャッシュ・ディレクトリ "' . $this->$dirCache . '" の作成に失敗しました';
+			return;
+		}
+	}
+}
+
+/**
+ * デストラクタ
+ * @return	なし
+*/
+function __destruct() {
+}
+
+/**
+ * エラー状況
+ * @return	bool TRUE:異常／FALSE:正常
+*/
+function iserror() {
+	return $this->error;
+}
+
+/**
+ * エラーメッセージ取得
+ * @param	なし
+ * @return	string 現在発生しているエラーメッセージ
+*/
+function geterror() {
+	return $this->errmsg;
+}
+
+/**
+ * PHP5以上かどうか検査する
+ * @return	bool TRUE：PHP5以上／FALSE:PHP5未満
+*/
+function isphp5over() {
+	$version = explode('.', phpversion());
+
+	return $version[0] >= 5 ? TRUE : FALSE;
+}
+
+/**
+ * キャッシュの削除
+ * @param	string $pat   削除するファイル名（正規表現指定可能）（省略可能）
+ * @param	int    $life  キャッシュ保持時間（分）（省略可能）
+ * @return	int 削除したファイル数
+*/
+function delete($pat='.+', $life=self::LIFE_CACHE) {
+	$fullname = $this->dirCache . '*';
+
+	$cnt = 0;
+	foreach (glob($fullname) as $name) {
+		//ファイルかつパターンにマッチしたファイルが削除対象
+		if (is_file($name) && (preg_match($pat, basename($name)) > 0)) {
+			$ft = filemtime($name);
+			//$lifeより古いファイルが削除対象
+			if ((time() - $ft) > $life * 60) {
+				if (unlink($name) == TRUE) {
+					$cnt++;
+				}
+			}
+		}
+	}
+
+	return $cnt;
+}
+
+/**
+ * cURLによるコンテンツ取得
+ * @param	string $url URL
+ * @return	mixed コンテンツ／FALSE：読み込み失敗
+*/
+function cLoad($url) {
+	$curl = curl_init($url);
+	curl_setopt($curl, CURLOPT_HEADER, FALSE);
+	curl_setopt($curl, CURLOPT_RETURNTRANSFER, TRUE);
+	curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, FALSE);	//サーバ証明書検証をスキップ
+	curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, FALSE);	//　　〃
+	$contents = curl_exec($curl);
+	if (($contents == FALSE) || (curl_errno($curl) != 0)) {
+		$this->error   = TRUE;
+		$this->errmsg  = '"' . $url . '" が取得できません';
+		return FALSE;
+	}
+	$arr = curl_getinfo($curl);
+	if ($arr['http_code'] != 200) {
+		$this->error   = TRUE;
+		$this->errmsg  = '"' . $url . '" が取得できません';
+		return FALSE;
+	}
+	curl_close($curl);
+
+	return $contents;
+}
+
+/**
+ * ネットからコンテンツを読み込む
+ * @param	string $url   URL
+ * @param	string $fname キャッシュ・ファイル名（フルパス）
+ * @return	mixed コンテンツ／FALSE：読み込み失敗
+*/
+function forceLoad($url) {
+	$fname = $this->dirCache . md5($url);	//キャッシュするファイル名
+
+	$res = $this->cLoad($url);
+	if ($res == FALSE) {
+		return FALSE;
+	}
+	$ret = file_put_contents($fname, $res);
+	if ($ret == FALSE) {
+		$this->error = TRUE;
+		$this->errmsg = 'キャッシュファイル "' . $fname . '" の書き込み失敗しました';
+		return FALSE;
+	}
+	$this->debug .= $url . "\n";
+
+	return $res;
+}
+
+/**
+ * コンテンツを読み込む
+ * @param	string $url URL
+ * @return	mixed コンテンツ／FALSE：読み込み失敗
+*/
+function load($url) {
+	//キャッシュ有効
+	if ($this->lifeCache > 0) {
+		$this->delete('/[0-9a-f]+/ui', $this->lifeCache);	//古いキャッシュを削除
+		$fname = $this->dirCache . md5($url);	//キャッシュするファイル名
+		//キャッシュが存在する
+		if (is_file($fname)) {
+			$res = file_get_contents($fname);
+			if ($res == FALSE) {
+				$this->error = TRUE;
+				$this->errmsg = 'キャッシュファイル "' . $fname . '" の読み込みに失敗しました';
+				return FALSE;
+			}
+			$this->debug .= $fname . "\n";
+		//ネットから取得
+		} else {
+			$res = $this->forceLoad($url);
+		}
+
+	//キャッシュ無効
+	} else {
+		$res = $this->forceLoad($url);
+	}
+
+	return $res;
+}
+
+/**
+ * キャッシュ・システムを利用したSimple XMLロード
+ * @param	string $url XMLファイル名（URL指定）
+ * @return	bool TRUE：取得成功／FALSE：失敗
+*/
+function simplexml_load($url) {
+	//キャッシュ・システムを使ったロード
+	$contents = $this->load($url);
+
+	//失敗したらネットから強制ロード
+	if ($this->iserror()) {
+		$this->error = FALSE;
+		$this->errmsg = '';
+		$contents = $this->forceLoad($url);
+		if ($this->iserror()) {
+			return FALSE;
+		}
+	}
+
+	//XMLロード
+	$xml = @simplexml_load_string($contents);
+
+	//キャッシュが壊れている可能性
+	if ($xml == FALSE) {
+		$contents = $this->forceLoad($url);
+		$xml = @simplexml_load_string($contents);
+		if ($xml == FALSE) {
+		$this->error   = TRUE;
+		$this->errmsg  = '"' . $url . '" が取得できません';
+			return FALSE;
+		}
+	}
+
+	return $xml;
+}
