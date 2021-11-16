@@ -1,0 +1,2206 @@
+<?php
+/** pahooGeoCode.php
+ * 住所・緯度・経度に関わるクラス
+ *
+ * @copyright	(c)studio pahoo
+ * @author		パパぱふぅ
+ * @動作環境	PHP 5/7/8
+ * @参考URL		https://www.pahoo.org/e-soul/webtech/php06/php06-05-01.shtm
+ * 				https://www.pahoo.org/e-soul/webtech/php06/php06-08-01.shtm
+ * 				https://www.pahoo.org/e-soul/webtech/php06/php06-09-01.shtm
+ * 				https://www.pahoo.org/e-soul/webtech/php06/php06-19-01.shtm
+ * 				https://www.pahoo.org/e-soul/webtech/php06/php06-33-01.shtm
+ *
+ * [利用するライブラリ]
+ *  PEAR::XML_Unserializer
+ *  JavaScript::Leaflet
+ *
+ * [利用するWebAPI]
+ *  GoogleMaps JavaScript API
+ *  GoogleMaps Geocoding API
+ *  ジオどすII API【廃止】
+ *  簡易逆ジオコーディングサービス
+ *      出典: 農研機構 (https://aginfo.cgk.affrc.go.jp/)
+ *  YOLP 標高API
+ *  YOLP 気象情報API
+ *  YOLPコンテンツジオコーダAPI
+ *  Yahoo! JavaScriptマップ【廃止】
+ *  HeartRails Geo API
+ *  OSM Nominatim
+ *
+ * [その他，利用する外部リソース]
+ *  地理院地図タイル
+ *  OpenStreetMapタイル
+*/
+
+// pahooGeoCodeクラス =======================================================
+class pahooGeoCode {
+	var $items;		//検索結果格納用
+	var $error;		//エラーフラグ
+	var $hits;		//検索ヒット件数
+	var $webapi;	//直前に呼び出したWebAPI URL
+
+	//Google Cloud Platform APIキー
+	//https://cloud.google.com/maps-platform/
+	//※Google Maps APIを利用しないのなら登録不要
+	var $GOOGLE_API_KEY_1 = '**************************';	//HTTPリファラ用
+	var $GOOGLE_API_KEY_2 = '**************************';	//IP制限用
+
+	//Yahoo! JAPAN Webサービス アプリケーションID
+	//https://e.developer.yahoo.co.jp/register
+	//※Yahoo! JAPAN Webサービスを利用しないのなら登録不要
+	var $YAHOO_APPLICATION_ID = '*****************************';
+
+	//ジオどすII APIキー【廃止】
+	//http://geodosu.com/user/register
+	var $APIKEY_GEODOS = '*****************';
+
+/**
+ * コンストラクタ
+ * @param	なし
+ * @return	なし
+*/
+function __construct() {
+	$this->error  = FALSE;
+	$this->errmsg = '';
+	$this->hits = 0;
+	$this->webapi = '';
+}
+
+/**
+ * デストラクタ
+ * @return	なし
+*/
+function __destruct() {
+	unset($this->items);
+}
+
+/**
+ * エラー状況
+ * @return	bool TRUE:異常／FALSE:正常
+*/
+function iserror() {
+	return $this->error;
+}
+
+/**
+ * エラーメッセージ取得
+ * @param	なし
+ * @return	string 現在発生しているエラーメッセージ
+*/
+function geterror() {
+	return $this->errmsg;
+}
+
+/**
+ * PHP5以上かどうか検査する
+ * @return	bool TRUE：PHP5以上／FALSE:PHP5未満
+*/
+function isphp5over() {
+	$version = explode('.', phpversion());
+
+	return $version[0] >= 5 ? TRUE : FALSE;
+}
+
+/**
+ * PHP7以上かどうか検査する
+ * @return	bool TRUE：PHP5以上／FALSE:PHP5未満
+*/
+function isphp7over() {
+	$version = explode('.', phpversion());
+
+	return $version[0] >= 7 ? TRUE : FALSE;
+}
+
+/**
+ * 無効な証明書サイトからXML取得できるようにする
+ * @param	なし
+ * @return	なし
+*/
+function unknown_certificate() {
+	$context = array(
+		'ssl' => array(
+			'verify_peer' => FALSE,
+			'verify_peer_name' => FALSE,
+		)
+	);
+	libxml_set_streams_context(stream_context_create($context));
+}
+
+// GoogleMaps API Geocoding =================================================
+/**
+ * 指定XMLファイルを読み込んでDOMを返す
+ * @param	string $xml XMLファイル名
+ * @return	object DOMオブジェクト／NULL 失敗
+*/
+function read_xml($xml) {
+	if ($this->isphp5over())	return NULL;
+	if (($fp = fopen($xml, 'r')) == FALSE)	return NULL;
+
+	//いったん変数に読み込む
+	$str = fgets($fp);
+	$str = preg_replace('/UTF-8/', 'utf-8', $str);
+
+	while (! feof($fp)) {
+		$str = $str . fgets($fp);
+	}
+	fclose($fp);
+
+	//DOMを返す
+	$dom = domxml_open_mem($str);
+	if ($dom == NULL) {
+		echo "\n>Error while parsing the document - " . $xml . "\n";
+		exit(1);
+	}
+
+	return $dom;
+}
+
+/**
+ * GoogleMaps API Geocodingのformatted_addressから国名、郵便番号を除く
+ * @param	string $formatted_address 国名、郵便番号付き住所
+ * @return	string 住所のみ
+*/
+function trimAddress($formatted_address) {
+	$pat1 = '/〒[0-9\-]+\s(.+)$/ui';
+	$pat2 = '/.+、(.+)$/ui';
+
+	if (preg_match($pat1, $formatted_address, $arr) > 0) {
+		$res = $arr[1];
+	} else if (preg_match($pat2, $formatted_address, $arr) > 0) {
+		$res = $arr[1];
+	} else {
+		$res = $formatted_address;
+	}
+
+	return $res;
+}
+
+/**
+ * GoogleMaps API Geocoding(V3) のURLを取得する
+ * @param	string $query 検索キーワード（UTF-8）
+ * @return	string URL URL
+*/
+function getURL_GeoCodeAPI_V3($query) {
+	$key = $this->GOOGLE_API_KEY_2;
+	return "https://maps.googleapis.com/maps/api/geocode/xml?key={$key}&language=ja&region=JP&address=" . urlencode($query);
+}
+
+/**
+ * Google Geocoding API(V3) を用いて住所・駅名の緯度・経度を求める
+ * @param	string $query 検索キーワード
+ * @param	array  $items 情報を格納する配列
+ * @return	int ヒットした施設数／(-1)：API呼び出し失敗
+*/
+function getPointsV3_all($query, &$items) {
+	$url = $this->getURL_GeoCodeAPI_V3($query);	//リクエストURL
+	$this->webapi = $url;
+	$n = 1;
+
+//PEAR::XML_Unserializer
+	if (class_exists('XML_Unserializer')) {
+		$xml = new XML_Unserializer();
+		$xml_data = file_get_contents($url);
+		$xml->unserialize($xml_data);
+		$arr = $xml->getUnserializedData();
+		//レスポンス・チェック
+		if (preg_match('/ok/i', $arr['status']) == 0)	return (-1);
+		//位置情報
+		if (isset($arr['result']['geometry'])) {
+			$items[$n]['latitude']  = $arr['result']['geometry']['location']['lat'];
+			$items[$n]['longitude'] = $arr['result']['geometry']['location']['lng'];
+			$items[$n]['address']   = $this->trimAddress($arr['result']['formatted_address']);
+			$n++;
+		} else {
+			foreach ($arr['result'] as $val) {
+				$items[$n]['latitude']  = $val['geometry']['location']['lat'];
+				$items[$n]['longitude'] = $val['geometry']['location']['lng'];
+				$items[$n]['address']   = $this->trimAddress($val['formatted_address']);
+				$n++;
+			}
+		}
+		$xml = NULL;
+
+//PHP4用; DOM XML利用
+	} else if ($this->isphp5over() == FALSE) {
+		if (($dom = $this->read_xml($url)) == NULL)	return FALSE;
+		$gr = $dom->get_elements_by_tagname('GeocodeResponse');
+		//レスポンス・チェック
+		$res  = $gr[0]->get_elements_by_tagname('status');
+		if (preg_match("/ok/i", $res[0]->get_content()) == 0)	return 0;
+		//位置情報
+		$res = $gr[0]->get_elements_by_tagname('result');
+		foreach ($res as $val) {
+			$geo = $val->get_elements_by_tagname('geometry');
+			$loc = $geo[0]->get_elements_by_tagname('location');
+			$lat = $loc[0]->get_elements_by_tagname('lat');
+			$items[$n]['latitude'] = (double)$lat[0]->get_content();
+			$lng = $loc[0]->get_elements_by_tagname('lng');
+			$items[$n]['longitude'] = (double)$lng[0]->get_content();
+			$addr = $val->get_elements_by_tagname('formatted_address');
+			$items[$n]['address'] = $this->trimAddress((string)$addr[0]->get_content());
+			$n++;
+		}
+//PHP5用; SimpleXML利用
+	} else {
+		$this->unknown_certificate();
+		$res = simplexml_load_file($url);
+		//レスポンス・チェック
+		if (preg_match("/ok/i", $res->status) == 0)		return 0;
+		foreach ($res->result as $element) {
+			$items[$n]['latitude']  = (double)$element->geometry->location->lat;
+			$items[$n]['longitude'] = (double)$element->geometry->location->lng;
+			$items[$n]['address']   = $this->trimAddress((string)$element->formatted_address);
+			$n++;
+		}
+	}
+	return ($n - 1);
+}
+
+/**
+ * Google Geocoding API V3 のリクエストURLを返す
+ * @param	string $query 検索キーワード（UTF-8）
+ * @return	string URL
+*/
+function geturl($query) {
+	return $this->getURL_GeoCodeAPI_V3($query);
+}
+
+/**
+ * 緯度経度文字列を分解する
+ * @param	string $str 緯度経度文字列
+ * @return	float  array(経度,緯度)
+*/
+function parse_geo($str) {
+	static $pat1 = '/E(\d+\.?\d*)N(\d+\.?\d*)/i';
+	static $pat2 = '/E(\d+)\.(\d+)\.(\d+)\.(\d+)N(\d+)\.(\d+)\.(\d+)\.(\d+)/i';
+
+	if (preg_match($pat1, $str, $regs) > 0) {
+		$longitude = $regs[1];
+		$latitude  = $regs[2];
+	} else if (preg_match($pat2, $str, $regs) > 0) {
+		$longitude = $regs[1] + $regs[2] / 60 + $regs[3] / 3600 + $regs[4] / 36000;
+		$latitude  = $regs[5] + $regs[6] / 60 + $regs[7] / 3600 + $regs[8] / 36000;
+	}
+
+	return array($latitude, $longitude);
+}
+
+/**
+ * Google Geocoding API V3 を用いて住所・駅名の緯度・経度を検索
+ * @param	string $query 検索キーワード（UTF-8）
+ * @return	int ヒットした地点数
+*/
+function searchPoint($query) {
+	unset($this->items);
+	$this->items = array();
+
+	//緯度・経度表記
+	$pat = '/E(\d+)\.(\d+)\.(\d+)\.(\d+)N(\d+)\.(\d+)\.(\d+)\.(\d+)/i';
+	if (preg_match($pat, $query) > 0) {
+		list($this->items[1]['latitude'], $this->items[1]['longitude']) =
+			$this->parse_geo($query);
+		$this->items[1]['address'] = '';
+		$this->hits = 1;
+
+	//Google Geocoding API使用
+	} else {
+		$n = $this->getPointsV3_all($query, $this->items);		//検索実行
+		if ($n == FALSE) {
+			$this->error  = TRUE;
+			$this->errmsg = 'Google Geocoding APIにトラブル発生';
+			$this->hits = 0;
+		} else if ($n == 0) {
+			$this->error  = TRUE;
+			$this->errmsg = '検索結果がない';
+			$this->hits = 0;
+		} else {
+			$this->hits = $n;
+		}
+	}
+
+	return $this->hits;
+}
+
+/**
+ * 検索結果（緯度・経度）を取得
+ * @param	int $id 取得したい地点番号
+ * @return	array(緯度,経度,住所)：世界測地系
+*/
+function getPoint($id) {
+	if ($id <= 0 || $id > $this->hits) {
+		$this->error  = TRUE;
+		$this->errmsg = '不正な地点番号';
+		$latitude  = FALSE;
+		$longitude = FALSE;
+		$address   = FALSE;
+	} else {
+		$this->error  = FALSE;
+		$this->errmsg = '';
+		$latitude  = $this->items[$id]['latitude'];
+		$longitude = $this->items[$id]['longitude'];
+		$address   = $this->items[$id]['address'];
+	}
+
+	return array($latitude, $longitude, $address);
+}
+
+/**
+ * Google Geocoding API を用いて緯度・経度から住所を求める
+ * @param	float $latitude  緯度（世界測地系，10進数の度表記）
+ * @param	float $longitude 経度（世界測地系，10進数の度表記）
+ * @return	array ['address']	フォーマット済み住所
+ * 				  ['$$$$']		都道府県など（サービスによって添字が変わる）
+ *			FALSE=エラー
+*/
+function getGoogleAddress($latitude, $longitude) {
+	$key = $this->GOOGLE_API_KEY_2;
+	$url = "https://maps.googleapis.com/maps/api/geocode/xml?key={$key}&latlng={$latitude},{$longitude}&language=ja&region=JP";
+	$this->webapi = $url;
+
+	$res = array();
+	$this->unknown_certificate();
+	$xml = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (preg_match("/ok/i", $xml->status) == 0)		return FALSE;
+	foreach ($xml->result as $element) {
+		if ($element->type == 'street_address') {
+			$res['address'] = $this->trimAddress((string)$element->formatted_address);
+			//有効な住所部品を格納
+			foreach ($element->address_component as $elem2) {
+				$str = '';
+				$flag = FALSE;
+				foreach ($elem2->type as $val) {
+					$type = (string)$val;
+					if (preg_match('/_level_[0-9]+/i', $type) > 0) {
+						$str = $type;
+					} else if ($type == 'postal_code') {
+						$flag = TRUE;
+						$str = $type;
+					} else if ($type == 'political') {
+						$flag = TRUE;
+					} else if ($str == '') {
+						$str = $type;
+					}
+				}
+				if ($flag && ($str != '')) {
+					$res[$str] = (string)$elem2->long_name;
+				}
+			}
+			break;
+		}
+	}
+
+	return $res;
+}
+
+// ジオどすII API ===========================================================
+/**
+ * ジオどすII・京都通り名ジオコーダAPI のURLを取得する
+ * @param	string $query 検索キーワード（UTF-8）
+ * @return	string URL URL
+*/
+function getURL_GeoDos_V2($query) {
+	return 'http://api.geodosu.com/v2/geodosu2?apikey=' . $this->APIKEY_GEODOS . '&address=' . urlencode($query);
+}
+
+/**
+ * ジオどすII・京都通り名ジオコーダAPI を用いて住所の緯度・経度を求める
+ * @param	string $query 検索キーワード
+ * @param	array  $items 情報を格納する配列
+ * @return	int ヒットした施設数
+*/
+function getPoints_GeoDos_V2($query, &$items) {
+	$url = $this->getURL_GeoDos_V2($query);	//リクエストURL
+	$this->webapi = $url;
+	$n = 1;
+
+//PEAR::XML_Unserializer
+	if (class_exists('XML_Unserializer')) {
+		$xml = new XML_Unserializer();
+		$xml_data = file_get_contents($url);
+		$xml->unserialize($xml_data);
+		$arr = $xml->getUnserializedData();
+		//位置情報
+		$items[$n]['latitude']  = (double)$arr['result']['coordinates']['point']['lat'];
+		$items[$n]['longitude'] = (double)$arr['result']['coordinates']['point']['lon'];
+		$items[$n]['address']   = (string)$arr['result']['addresses']['pre_processed'];
+		$xml = NULL;
+
+//PHP4用; DOM XML利用
+	} else if ($this->isphp5over() == FALSE) {
+		if (($dom = $this->read_xml($url)) == NULL)	return FALSE;
+		$result = $dom->get_elements_by_tagname('result');
+		//レスポンス・チェック
+		$co = $result[0]->get_elements_by_tagname('coordinates');
+		//位置情報
+		$po = $co[0]->get_elements_by_tagname('point');
+		$lat = $po[0]->get_elements_by_tagname('lat');
+		$items[$n]['latitude'] = (double)$lat[0]->get_content();
+		$lng = $po[0]->get_elements_by_tagname('lon');
+		$items[$n]['longitude'] = (double)$lng[0]->get_content();
+		$addr = $result[0]->get_elements_by_tagname('addresses');
+		$pre  = $addr[0]->get_elements_by_tagname('pre_processed');
+		$items[$n]['address'] = (string)$pre[0]->get_content();
+//PHP5用; SimpleXML利用
+	} else {
+		$this->unknown_certificate();
+		$res = simplexml_load_file($url);
+		//レスポンス・チェック
+		$items[$n]['latitude']  = (double)$res->result->coordinates->point->lat;
+		$items[$n]['longitude'] = (double)$res->result->coordinates->point->lon;
+		$items[$n]['address']   = (string)$res->result->addresses->pre_processed;
+	}
+
+	return $n;
+}
+
+/**
+ * Google Geocoding API(V3)＋ジオどすII API を用いて
+ * 住所・駅名の緯度・経度を検索
+ *
+ * @param	string $query 検索キーワード（UTF-8）
+ * @return	array(int ヒットした地点数,string WebAPI)
+*/
+function searchPoint2($query) {
+	static $pat1 = '/E(\d+\.?\d*)N(\d+\.?\d*)/i';
+	static $pat2 = '/E(\d+)\.(\d+)\.(\d+)\.(\d+)N(\d+)\.(\d+)\.(\d+)\.(\d+)/i';
+
+	unset($this->items);
+	$this->items = array();
+	$this->hits = 0;
+
+	//緯度・経度表記(1)
+	if (preg_match($pat1, $query) > 0) {
+		list($this->items[1]['latitude'], $this->items[1]['longitude']) =
+			$this->parse_geo($query);
+		$this->items[1]['address'] = '';
+		$this->hits = 1;
+
+	//緯度・経度表記(2)
+	} else if (preg_match($pat2, $query) > 0) {
+		list($this->items[1]['latitude'], $this->items[1]['longitude']) =
+			$this->parse_geo($query);
+		$this->items[1]['address'] = '';
+		$this->hits = 1;
+	}
+	//Google Geocoding API使用
+	if ($this->hits == 0) {
+		$n = $this->getPointsV3_all($query, $this->items);
+		if ($n == FALSE) {
+			$this->error  = TRUE;
+			$this->errmsg = 'Google Geocoding APIにトラブル発生';
+			$this->hits = 0;
+		} else if ($n == 0) {
+			$this->error  = TRUE;
+			$this->errmsg = '検索結果がない';
+			$this->hits = 0;
+		} else {
+			$this->hits = $n;
+		}
+	}
+
+	return array($this->hits, $this->webapi);
+}
+
+// 簡易逆ジオコーディングサービス ============================================
+/**
+ * 簡易逆ジオコーディングサービスのWebAPI URLを取得する
+ * @param	float $latitude  緯度（世界測地系，10進数の度表記）
+ * @param	float $longitude 経度（世界測地系，10進数の度表記）
+ * @return	string URL URL
+*/
+function getURLrgeocode($latitude, $longitude) {
+	return "https://aginfo.cgk.affrc.go.jp/ws/rgeocode.php?v=2&lat={$latitude}&lon={$longitude}";
+}
+
+/**
+ * 簡易逆ジオコーディングサービスを用いて緯度・経度から住所を求める
+ * @param	float $latitude  緯度（世界測地系，10進数の度表記）
+ * @param	float $longitude 経度（世界測地系，10進数の度表記）
+ * @return	array (都道府県名,市町村名,町丁目,番地)／FALSE=エラー
+*/
+function getAddress($latitude, $longitude) {
+	//APIコール
+	$url = $this->getURLrgeocode($latitude, $longitude);
+	$this->webapi = $url;
+
+//PHP4用; DOM XML利用
+	if ($this->isphp5over() == FALSE) {
+		if (($dom = read_xml($url)) == NULL)	return FALSE;
+		$rgeocode = $dom->get_elements_by_tagname('rgeocode');
+		//住所取得
+		if (($result = $rgeocode[0]->get_elements_by_tagname('result')) == NULL)	return FALSE;
+		if (($pref = $result[0]->get_elements_by_tagname('prefecture')) == NULL)	return FALSE;
+		if (($pref2 = $pref[0]->get_elements_by_tagname('pname')) == NULL)			return FALSE;
+		$prefecture = $pref2[0]->get_content();
+		$muni = $result[0]->get_elements_by_tagname('municipality');
+		$municipality = '';
+		if ($muni != NULL) {
+			$muni2 = $muni[0]->get_elements_by_tagname('mname');
+			if ($muni2 != NULL)		$municipality = $muni2[0]->get_content();
+		}
+		$section = '';
+		$homenumber = '';
+		$loc = $result[0]->get_elements_by_tagname('local');
+		if ($loc != NULL) {
+			$loc2 = $loc[0]->get_elements_by_tagname('section');
+			if ($loc2 != NULL)	$section = $loc2[0]->get_content();
+			$loc2 = $loc[0]->get_elements_by_tagname('homenumber');
+			if ($loc2 != NULL)	$homenumber = $loc2[0]->get_content();
+		}
+
+//PHP5用; SimpleXML利用
+	} else {
+		$this->unknown_certificate();
+		$rgeocode = simplexml_load_file($url);
+		//レスポンス・チェック
+		if (! isset($rgeocode->result)) {
+			$this->error = TRUE;
+			$this->errmsg = '簡易ジオコーディングサービス' . (isset($rgeocode->error) ? (' ' . $rgeocode->error) : 'にトラブル発生');
+			return FALSE;
+		}
+		//住所取得
+		$prefecture = $rgeocode->result->prefecture->pname;
+		$municipality = $rgeocode->result->municipality->mname;
+		$section = $rgeocode->result->local->section;
+		$homenumber = $rgeocode->result->local->homenumber;
+	}
+
+	return array($prefecture, $municipality, $section, $homenumber);
+}
+
+// 座標計算 =================================================================
+/**
+ * 日本測地系を世界測地系に変換する
+ * @param	float $long 経度（日本測地系）
+ * @param	float $lat  緯度（日本測地系）
+ * @return	float array(経度,緯度)（世界測地系）
+*/
+function tokyo_wgs84($long, $lat) {
+	$glong = $long - $lat * 0.000046038 - $long * 0.000083043 + 0.010040;
+	$glat  = $lat  - $lat * 0.00010695  + $long * 0.000017464 + 0.0046017;
+	return array($glong, $glat);
+}
+
+/**
+ * 世界測地系を日本測地系に変換する
+ * @param	float $long 経度（世界測地系）
+ * @param	float $lat  緯度（世界測地系）
+ * @return	float array(経度,緯度)（日本測地系）
+*/
+function wgs84_tokyo($long, $lat) {
+	$glong = $long + $lat * 0.000046047 + $long * 0.000083049 - 0.010041;
+	$glat  = $lat  + $lat * 0.00010696  - $long * 0.000017467 - 0.0046020;
+	return array($glong, $glat);
+}
+
+/**
+ * 2地点間の直線距離を求める（Hubenyの簡易式による；日本測地系！）
+ * @param	float $long_a, $lati_a  A地点の経度，緯度（世界測地系）
+ * @param	float $long_b, $lati_b  B地点の経度，緯度（世界測地系）
+ * @return	float 直線距離（メートル）
+*/
+function distance($long_a, $lati_a,  $long_b, $lati_b) {
+	//西経の補正
+	if ($long_a < 0)	$long_a += 360;
+	if ($long_b < 0)	$long_b += 360;
+
+	//ラジアンに変換
+	$long_a = deg2rad($long_a);
+	$lati_a = deg2rad($lati_a);
+	$long_b = deg2rad($long_b);
+	$lati_b = deg2rad($lati_b);
+
+	$latave = ($lati_a + $lati_b) / 2;
+	$latidiff = $lati_a - $lati_b;
+	$longdiff = $long_a - $long_b;
+
+	//子午線曲率半径
+	$meridian = 6335439 / sqrt(pow(1 - 0.006694 * sin($latave) * sin($latave), 3));
+	//卯酉線曲率半径
+	$primevertical = 6378137 / sqrt(1 - 0.006694 * sin($latave) * sin($latave));
+
+	//Hubenyの簡易式
+	$x = $meridian * $latidiff;
+	$y = $primevertical * cos($latave) * $longdiff;
+
+	return sqrt($x * $x + $y * $y);
+}
+
+/**
+ * ある地点から指定距離離れた地点の緯度・経度を求める
+ * @param	float $longitude 経度（世界測地系）
+ * @param	float $latitude  緯度（世界測地系）
+ * @param	float $y         北への距離（メートル；南ならマイナス）
+ * @param	float $x         東への距離（メートル；西ならマイナス）
+ * @return	float array(緯度,経度)
+*/
+function getPointDistance($longitude, $latitude, $y, $x) {
+	$rad = 6378137;			//地球の半径（メートル）
+
+	$lat = ($y / $rad + $latitude * (pi() / 180)) * (180 / pi());
+	$lng = ($x / ($rad * cos($latitude * (pi() / 180))) + $longitude * (pi() / 180)) * (180 / pi());
+
+	return array($lat, $lng);
+}
+
+/**
+ * ある地点から方位角と距離を指定した地点の緯度・経度を求める
+ * @param	float $longitude 経度（世界測地系）
+ * @param	float $latitude  緯度（世界測地系）
+ * @param	float $angle     方位角（度）
+ * @param	float $distance  距離（メートル）
+ * @return	float array(緯度,経度)
+*/
+function getPointAngle($longitude, $latitude, $angle, $distance) {
+	$rad = 6378137.0;			//地球の半径（メートル）
+	$e2  = 6.69437999019758E-03;
+
+	$wt  = sqrt(1.0 - $e2 * pow(sin($latitude * pi() / 180.0), 2));
+	$mt  = $rad * (1.0 - $e2) / pow($wt, 3);
+	$dit = $distance * cos($angle * pi() / 180.0) / $mt;
+	$i   = $latitude * pi() / 180.0 + $dit / 2;
+	$w   = sqrt(1.0 - $e2 * pow(sin($i), 2));
+
+	//緯度
+	$m   = $rad * (1 - $e2) / pow($w, 3);
+	$di  = $distance * cos($angle * pi() / 180) / $m;
+	$lat = $latitude + $di * 180 / pi();
+
+	//経度
+	$n   = $rad / $w;
+	$dk  = $distance * sin($angle * pi() / 180) / ($n * cos($i));
+	$lng = $longitude + $dk * 180 / pi();
+
+	return array($lat, $lng);
+}
+
+/**
+ * 2地点間の大圏航路距離を求める
+ * @param	float $long_a, $lati_a  A地点の経度，緯度（世界測地系）
+ * @param	float $long_b, $lati_b  B地点の経度，緯度（世界測地系）
+ * @return	float 大圏航路距離
+ *
+*/
+function greatCircleDistance($long_a, $lati_a, $long_b, $lati_b) {
+	$lati_a = deg2rad($lati_a);
+	$long_a = deg2rad($long_a);
+	$lati_b = deg2rad($lati_b);
+	$long_b = deg2rad($long_b);
+
+	//距離の計算
+	$ll = abs($long_b - $long_a);
+	$distance = 6371.0 * acos(sin($lati_a) * sin($lati_b) + cos($lati_a) * cos($lati_b) * cos($ll));
+
+	return $distance;
+}
+
+/**
+ * 2地点間の大圏航路軌跡を求める
+ * @param	float $long_a, $lati_a  A地点の経度，緯度（世界測地系）
+ * @param	float $long_b, $lati_b  B地点の経度，緯度（世界測地系）
+ * @param	array  $points  軌跡の座標を格納
+ *						[$n]['longitude'] 軌跡の経度（世界測地系）
+ *						[$n]['latitude']  軌跡の緯度（世界測地系）
+ * @return	int 座標の数
+ *
+*/
+function greatCircleSailing($long_a, $lati_a, $long_b, $lati_b, &$points) {
+	$lati_a = deg2rad($lati_a);
+	$long_a = deg2rad($long_a);
+	$lati_b = deg2rad($lati_b);
+	$long_b = deg2rad($long_b);
+
+	$l1 = ($long_a >= 0) ? $long_a : 2 * pi() + $long_a;
+	$l2 = ($long_b >= 0) ? $long_b : 2 * pi() + $long_b;
+	$dd = $l2 - $l1;
+	$tt = 0.01;			//経度方向の増分
+	if ($dd < 0) {
+		$dd = abs($dd);
+		$tt = -$tt;
+	} else if ($dd > pi()) {
+		list($lati_a, $lati_b) = array($lati_b, $lati_a);
+		list($long_a, $long_b) = array($long_b, $long_a);
+		$dd = 2 * pi() - $dd;
+	}
+	$st = 0.0;
+	$cnt = 0;
+
+	//軌跡の計算
+	$latitude  = $lati_a;
+	$longitude = $long_a;
+	while ($st < $dd) {
+		if ($latitude  >= 0.5 * pi())	$latitude -= pi();
+		if ($longitude >= 1.0 * pi())	$longitude = $longitude - pi();
+		$points[$cnt]['latitude']  = rad2deg($latitude);
+		$points[$cnt]['longitude'] = rad2deg($longitude);
+		$longitude += $tt;
+		if ($longitude >= pi())		$longitude = $longitude - 2 * pi();
+		$latitude = (sin($lati_a) * sin($long_b - $longitude)) / (cos($lati_a) * sin($long_b - $long_a)) + (sin($lati_b) * sin($long_a - $longitude)) / (cos($lati_b) * sin($long_a - $long_b));
+		$latitude = atan($latitude);
+		if (sin($lati_a) / sin($lati_b) < 0)	$latitude += pi();
+
+		$st += abs($tt);
+		$cnt++;
+	}
+	$points[$cnt]['latitude']  = rad2deg($lati_b);
+	$points[$cnt]['longitude'] = rad2deg($long_b);
+	$cnt++;
+
+	return $cnt;
+}
+
+/**
+ * 2地点間の等角航路軌跡を求める
+ * @param	float $long_a, $lati_a  A地点の経度，緯度（世界測地系）
+ * @param	float $long_b, $lati_b  B地点の経度，緯度（世界測地系）
+ * @param	array  $points  軌跡の座標を格納
+ *						[$n]['longitude'] 軌跡の経度（世界測地系）
+ *						[$n]['latitude']  軌跡の緯度（世界測地系）
+ * @return	float $distance 2地点間の等角航路距離を格納
+ * @return	int 座標の数
+ *
+*/
+function rhumbLine($long_a, $lati_a, $long_b, $lati_b, &$points, &$distance) {
+	$lati_a = deg2rad($lati_a);
+	$long_a = deg2rad($long_a);
+	$lati_b = deg2rad($lati_b);
+	$long_b = deg2rad($long_b);
+	$n = 200;
+
+	//経度方向の増分
+	$l1 = ($long_a >= 0) ? $long_a : 2 * pi() + $long_a;
+	$l2 = ($long_b >= 0) ? $long_b : 2 * pi() + $long_b;
+	$d1 = $l2 - $l1;
+	$t1 = 0.01;
+	$n = abs($d1) / $t1;
+	if ($d1 < 0) {
+		$d1 = 2 * pi() + $d1;
+		$t1 = -$t1;
+	} else if ($d1 > pi()) {
+		list($lati_a, $lati_b) = array($lati_b, $lati_a);
+		list($long_a, $long_b) = array($long_b, $long_a);
+		$d1 = 2 * pi() - $d1;
+		$n = abs($d1) / $t1;
+	}
+
+	//緯度方向の増分
+	$l1 = $lati_a;
+	$l2 = $lati_b;
+	$d2 = $l2 - $l1;
+	if ($d2 >= pi()) {
+		$d2 -= pi();
+		$t2 = - $d2 / $n;
+	} else {
+		$t2 = $d2 / $n;				//緯度方向の増分
+	}
+
+	//軌跡の計算
+	$latitude  = $lati_a;
+	$longitude = $long_a;
+	$distance  = 0.0;
+	for ($cnt = 0; $cnt < $n; $cnt++) {
+		if ($latitude  >= 0.5 * pi())	$latitude -= pi();
+		if ($longitude >= 1.0 * pi())	$longitude = $longitude - 2 * pi();
+		$points[$cnt]['latitude']  = rad2deg($latitude);
+		$points[$cnt]['longitude'] = rad2deg($longitude);
+		$longitude += $t1;
+		$latitude  += $t2;
+		if ($cnt >= 1) {
+			$distance += $this->greatCircleDistance($points[$cnt - 1]['longitude'], $points[$cnt - 1]['latitude'], $points[$cnt]['longitude'], $points[$cnt]['latitude']);
+		}
+	}
+	$points[$cnt]['latitude']  = rad2deg($lati_b);
+	$points[$cnt]['longitude'] = rad2deg($long_b);
+	$distance += $this->greatCircleDistance($points[$cnt - 1]['longitude'], $points[$cnt - 1]['latitude'], $points[$cnt]['longitude'], $points[$cnt]['latitude']);
+	$cnt++;
+
+	return $cnt;
+}
+
+/**
+ * キロメートル→マイル変換
+ * @param	float $km キロメートル
+ * @return	float マイル
+ *
+*/
+function km2mi($km) {
+	return $km / 1.609344;
+}
+
+/**
+ * キロメートル→マイル変換
+ * @param	float $km キロメートル
+ * @return	float 海里
+ *
+*/
+function km2nm($km) {
+	return $km / 1.852;
+}
+
+
+// Googleマップ描画 ========================================================
+/**
+ * 数値に対応するアルファベットを返す
+ * @param	int $i 値
+ * @return	string アルファベット
+*/
+function num2alpha($i) {
+	return chr(64 + $i);
+}
+
+/**
+ * Googleマップを描く
+ * @param	string $id        マップID
+ * @param	float $latitude  中心座標：緯度（世界測地系）
+ * @param	float $longitude 中心座標：経度（世界測地系）
+ * @param	string $type      マップタイプ：HYBRID/ROADMAP/SATELLITE/TERRAIN
+ * @param	int    $zoom      拡大率
+ * @param	string $call      イベント発生時にコールする関数（省略可）
+ * @param	array  $items     地点情報（省略可能）
+ *					string title       タイトル
+ *					string description 情報ウィンドウに表示する内容（HTML文）
+ *					float latitude    緯度
+ *					float longitude   経度
+ *					string icon        アイコンURL
+ * @param	string $call2     追加スクリプト（省略可）
+ * @param	int    $max_width 情報ウィンドウの最大幅（省略時：200）
+ * @return	string Googleマップのコード
+*/
+function drawGMap($id, $latitude, $longitude, $type, $zoom, $call=NULL, $items=NULL, $call2=NULL, $max_width=200) {
+	$key = $this->GOOGLE_API_KEY_1;
+	$call = ($call != NULL) ? $call . '()' : '';
+	$code =<<< EOD
+<script src="https://maps.googleapis.com/maps/api/js?key={$key}&amp;callback=initMap&amp;region=JP" async defer></script>
+<script>
+function initMap() {
+	var map = new google.maps.Map(document.getElementById('{$id}'), {
+		center: new google.maps.LatLng({$latitude}, {$longitude}),
+		zoom: {$zoom},
+		mapTypeId: google.maps.MapTypeId.{$type},
+		mapTypeControl: true,
+		scaleControl: true
+	});
+
+    map.addListener('dragend', getPointData);
+	map.addListener('zoom_changed', getPointData);
+	map.addListener('maptypeid_changed', getPointData);
+
+	//イベント発生時の地図情報を取得・格納
+	function getPointData() {
+		var point = map.getCenter();
+		//経度
+		if (document.getElementById("longitude") != null) {
+			document.getElementById("longitude").value = point.lng();
+		}
+		//緯度
+		if (document.getElementById("latitude") != null) {
+			document.getElementById("latitude").value = point.lat();
+		}
+		//ズーム
+		if (document.getElementById("zoom") != null) {
+			document.getElementById("zoom").value = map.getZoom();
+		}
+		//地図タイプ
+		if (document.getElementById("type") != null) {
+			var type_g = map.getMapTypeId();
+			var types = {"roadmap":"地図", "satellite":"航空写真", "hybrid":"ハイブリッド", "terrain":"地形図" };
+			for (key in types) {
+				if (key == type_g) {
+					document.getElementById("type").value = key;
+					break;
+				}
+			}
+		}
+		{$call}
+	}
+
+EOD;
+	//地点情報
+	if ($items != NULL) {
+		foreach ($items as $i=>$item) {
+			if ($i > 26)	break;		//'Z'を超えたらスキップ
+			//アイコン
+			$mark = $this->num2alpha($i);
+			$icon = isset($item['icon']) ? $item['icon'] : 
+						"http://www.google.com/mapfiles/marker{$mark}.png";
+			list($icon_width, $icon_height) = getimagesize($icon);
+			$code .=<<< EOD
+var icon_{$mark} = {
+	url: '{$icon}',
+	size: new google.maps.Size({$icon_width}, {$icon_height}),
+	origin: new google.maps.Point(0, 0),
+	anchor: new google.maps.Point({$icon_width} / 2, {$icon_height})
+};
+var marker_{$mark} = new google.maps.Marker({
+	position: new google.maps.LatLng({$item['latitude']}, {$item['longitude']}),
+	map: map,
+	icon: icon_{$mark},
+	title: '{$item['title']}',
+	zIndex: 100
+});
+
+EOD;
+			if (isset($item['description'])) {
+				$code .=<<< EOD
+var infowindow_{$mark} = new google.maps.InfoWindow({
+	content: '{$item['description']}',
+	maxWidth: {$max_width}
+});
+marker_{$mark}.addListener('click', function() {
+	infowindow_{$mark}.open(map, marker_{$mark});
+});
+
+EOD;
+			}
+		}
+	}
+	//追加関数
+	if ($call2 != NULL) {
+		$code .=<<< EOD
+{$call2}
+
+EOD;
+	}
+	$code .=<<< EOD
+}
+</script>
+
+EOD;
+
+	return $code;
+}
+
+/**
+ * GoogleMaps staticmap の画像URLを求める
+ * @param	array  $items 情報配列
+ * @return	string 画像URL
+*/
+function getStaticMap($items) {
+	$key = $this->GOOGLE_API_KEY_1;
+
+	return "http://maps.googleapis.com/maps/api/staticmap?center={$items['latitude']},{$items['longitude']}&amp;markers=color:red%7Clabel:A%7C{$items['latitude']},{$items['longitude']}&amp;zoom={$items['zoom']}&amp;size={$items['width']}x{$items['height']}&amp;key={$key}";
+}
+
+/**
+ * 直線描画スクリプト：Googleマップ用
+ * @param	array  $points  直線の座標配列
+ *						[$n]['longitude'] 経度（世界測地系）
+ *						[$n]['latitude']  緯度（世界測地系）
+ * @param	string $color   描画色（省略時=#FF0000）
+ * @param	float  $opacity 透明度（省略時=1）
+ * @param	int    $weight  線の太さ（省略時=1）
+ * @return	string JavaScript
+*/
+function jsLine_Gmap($points, $color='#FF0000', $opacity=1.0, $weight=1) {
+	$ss = '';
+	$cnt = 0;
+	foreach ($points as $pt) {
+		if ($cnt > 0)	$ss .= ",\n";
+		$ss .= "\t\tnew google.maps.LatLng({$pt['latitude']}, {$pt['longitude']})";
+		$cnt++;
+	}
+
+	$js =<<< EOT
+	var pt = [
+{$ss}
+	];
+	var lines = new google.maps.Polyline({
+		map: map,
+		path: pt,
+		strokeColor: '{$color}',
+		strokeOpacity: {$opacity},
+		strokeWeight: {$weight}
+	});
+	lines.setMap(map);
+
+EOT;
+	return $js;
+}
+
+// YOLP 標高API =============================================================
+/**
+ * YOLP 標高API のURLを取得する
+ * @param	float $latitude  緯度（世界測地系）
+ * @param	float $longitude 経度（世界測地系）
+ * @return	string URL YOLP 標高API のURL
+*/
+function getURL_YOLP_altitude($latitude, $longitude) {
+	$appID = $this->YAHOO_APPLICATION_ID;
+
+	$url = "https://map.yahooapis.jp/alt/V1/getAltitude?appid={$appID}&coordinates={$longitude},{$latitude}&output=xml";
+
+	return $url;
+}
+
+/**
+ * 「YOLP 標高API」を利用して標高を求める
+ * @param	float $latitude  緯度（世界測地系）
+ * @param	float $longitude 経度（世界測地系）
+ * @return	float 標高（メートル）／FALSE
+*/
+function getAltitude($latitude, $longitude) {
+	$url = $this->getURL_YOLP_altitude($latitude, $longitude);
+	$this->webapi = $url;
+
+//PHP4用; DOM XML利用
+	if ($this->isphp5over() == FALSE) {
+		if (($dom = $this->read_xml($url)) == NULL)	return FALSE;
+		$pagingInfo = $dom->get_elements_by_tagname('YDF');
+		//レスポンス・チェック
+		$rc = $pagingInfo[0]->get_elements_by_tagname('recordCount');
+		$rc = (int)$rc[0]->get_content();
+		if ($rc <= 0)	return FALSE;
+		//検索結果取りだし
+		$hotels = $dom->get_elements_by_tagname('hotels');
+		$hotel  = $hotels[0]->get_elements_by_tagname('hotel');
+		$cnt = 1;
+		foreach ($hotel as $val) {
+			foreach ($RakutenItems as $name) {
+				$node = $val->get_elements_by_tagname('hotelBasicInfo');
+				$node = $node[0]->get_elements_by_tagname($name);
+				if ($node != NULL) {
+					$items[$cnt][$name] = (string)$node[0]->get_content();
+				}
+			}
+			$cnt++;
+		}
+
+//PHP5用; SimpleXML利用
+	} else {
+		$this->unknown_certificate();
+		$xml = simplexml_load_file($url);
+		//レスポンス・チェック
+		if ($xml == NULL)	return FALSE;
+		if ($xml->ResultInfo->Count <= 0)	return FALSE;
+		//検索結果取りだし
+		$alt = (double)$xml->Feature[0]->Property->Altitude;
+	}
+
+	return $alt;
+}
+
+/**
+ * 気圧を求める
+ * @param	float $altitude 標高（メートル）
+ * @return	float 気圧（ヘクトパスカル）
+*/
+function getPressure($altitude) {
+	return pow(10, (log10(1013.25) - ($altitude / 18410)));
+}
+
+// YOLP 気象情報API ==========================================================
+/**
+ * 「YOLP 気象情報API」のリクエストURLを取得する
+ * @param	float $latitude  緯度（世界測地系）
+ * @param	float $longitude 経度（世界測地系）
+ * @return	string URL YOLP 標高API のURL
+*/
+function getURL_YOLP_precipitation($latitude, $longitude) {
+	$appID = $this->YAHOO_APPLICATION_ID;
+
+	$url = "https://map.yahooapis.jp/weather/V1/place?appid={$appID}&coordinates={$longitude},{$latitude}&output=xml&past=2&interval=10";
+
+	return $url;
+}
+
+/**
+ * 「YOLP 気象情報API」を利用して降水量を求める
+ * @param	array  $items     降水量を格納する配列
+ * @param	float $latitude  緯度（世界測地系）
+ * @param	float $longitude 経度（世界測地系）
+ * @return	bool TRUE/FALSE
+*/
+function getPrecipitation(&$items, $latitude, $longitude) {
+	$url = $this->getURL_YOLP_precipitation($latitude, $longitude);
+	$this->webapi = $url;
+
+//PHP4用; DOM XML利用
+	if ($this->isphp5over() == FALSE) {
+		if (($dom = $this->read_xml($url)) == NULL)	return FALSE;
+		//レスポンス・チェック
+		$node = $dom->get_elements_by_tagname('ResultInfo');
+		$node = $node[0]->get_elements_by_tagname('Count');
+		$rc = (int)$node[0]->get_content();
+		if ($rc <= 0)	return FALSE;
+		//検索結果取りだし
+		$node = $dom->get_elements_by_tagname('Feature');
+		$node = $node[0]->get_elements_by_tagname('Property');
+		$node = $node[0]->get_elements_by_tagname('WeatherList');
+		$node = $node[0]->get_elements_by_tagname('Weather');
+		foreach ($node as $val) {
+			$n2 = $val->get_elements_by_tagname('Date');
+			$dt = (string)$n2[0]->get_content();
+			$n2 = $val->get_elements_by_tagname('Rainfall');
+			$items[$dt]['Rainfall'] = (double)$n2[0]->get_content();
+			$n2 = $val->get_elements_by_tagname('Type');
+			$items[$dt]['Type'] = (string)$n2[0]->get_content();
+		}
+
+//PHP5用; SimpleXML利用
+	} else {
+		$this->unknown_certificate();
+		$xml = simplexml_load_file($url);
+		//レスポンス・チェック
+		if ($xml->ResultInfo->Count <= 0)	return FALSE;
+		//検索結果取りだし
+		foreach ($xml->Feature->Property->WeatherList->Weather as $weather) {
+			$dt = (string)$weather->Date;
+			$items[$dt]['Rainfall'] = (double)$weather->Rainfall;
+			$items[$dt]['Type'] = (string)$weather->Type;
+		}
+	}
+
+	return TRUE;
+}
+
+// YOLPコンテンツジオコーダAPI ===============================================
+/**
+ * YOLPコンテンツジオコーダAPI のリクエストURLを取得する
+ * @param	string $query 検索キーワード（UTF-8）
+ * @param	string $category 検索対象カテゴリ
+ *                           address  = 住所（省略時）
+ *                           landmark = ランドマーク
+ *                           world    = 世界
+ * @return	string URL リクエストURL
+*/
+function getURL_YOLP_GeoCoder($query, $category='address') {
+	$appid = $this->YAHOO_APPLICATION_ID;
+	return "https://map.yahooapis.jp/geocode/cont/V1/contentsGeoCoder?appid={$appid}&el=UTF-8&output=xml&category={$category}&query=" . urlencode($query);
+}
+
+/**
+ * YOLPコンテンツジオコーダAPI を用いて住所・駅名の緯度・経度を求める
+ * @param	string $query 検索キーワード
+ * @param	array  $items 情報を格納する配列
+ * @param	string $category 検索対象カテゴリ
+ *                           address  = 住所（省略時）
+ *                           landmark = ランドマーク
+ *                           world    = 世界
+ * @return	int ヒットした施設数／(-1)：API呼び出し失敗
+*/
+function getPointsYOLP_all($query, &$items, $category='address') {
+	$url = $this->getURL_YOLP_GeoCoder($query, $category);	//リクエストURL
+	$this->webapi = $url;
+	$n = 1;
+
+	$this->unknown_certificate();
+	$res = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (!isset($res->ResultInfo))	return (-1);
+	if (isset($res->ResultInfo->Total) && ((int)$res->ResultInfo->Total <= 0))	return 0;		//v.5.73追加
+
+	foreach ($res->Feature as $element) {
+		if (preg_match('/([\-0-9\.]+)\,([\-0-9\.]+)/i', $element->Geometry->Coordinates, $arr) > 0) {
+			if (isset($arr[1]) && isset($arr[2])) {
+				$items[$n]['latitude']  = (double)$arr[2];
+				$items[$n]['longitude'] = (double)$arr[1];
+				$items[$n]['address']   = (string)$element->Property->Address;
+				$n++;
+			}
+		}
+	}
+
+	return ($n - 1);
+}
+
+/**
+ * YOLPコンテンツジオコーダAPI のカテゴリ選択ラジオボタンの生成
+ * @param	string $name    HTML name
+ * @param	string $default デフォルト値（省略可能）
+ * @return	string HTML
+*/
+function makeYOLP_GeoSelectCategory($name, $default='') {
+	//デフォルト値設定
+	if (isset($this->YOLP_GeoCategory[$default])) {
+		foreach ($this->YOLP_GeoCategory as $key=>$item) {
+			$item[$key]['checked'] = '';
+		}
+		$this->YOLP_GeoCategory[$default]['checked'] = 'checked';
+	}
+	//選択ラジオボタンの生成
+	$html = '';
+	$i = 1;
+	foreach ($this->YOLP_GeoCategory as $key=>$val) {
+		$html .= "<input type=\"radio\" name=\"{$name}\" value=\"{$key}\" {$val['checked']} />{$val['title']}　";
+		$i++;
+	}
+	return $html;
+}
+
+//カテゴリ
+var $YOLP_GeoCategory = array(
+	//値                    タイトル               ラジオボタンcheked
+	'address'   => array('title'=>'住所',         'checked'=>'checked'),
+	'landmark'  => array('title'=>'ランドマーク', 'checked'=>''),
+	'world'     => array('title'=>'世界',         'checked'=>'')
+);
+
+/**
+ * checkedされているカテゴリを検索する
+ * @return	string 選択された関数名／FALSE=checkedされている処理がない
+*/
+function getYOLP_GeoSelectCategory() {
+	foreach ($this->YOLP_GeoCategory as $key=>$val) {
+		if ($val['checked'] == 'checked')	return $key;
+	}
+
+	return FALSE;
+}
+
+/**
+ * カテゴリをchekedする
+ * @param	string $val カテゴリ値
+ * @return	bool TRUE/FALSE
+*/
+function setYOLP_GeoSelectCategory($val) {
+	$old = $this->getYOLP_GeoSelectCategory();
+	if ($val != FALSE)	$this->YOLP_GeoCategory[$old]['checked'] = '';
+	$this->YOLP_GeoCategory[$val]['checked'] = 'checked';
+
+	return TRUE;
+}
+
+// Yahoo!リバースジオコーダAPI ==============================================
+/**
+ * Yahoo!リバースジオコーダAPIを用いて緯度・経度から住所を求める
+ * @param	float $latitude  緯度（世界測地系，10進数の度表記）
+ * @param	float $longitude 経度（世界測地系，10進数の度表記）
+ * @return	array ['address']	フォーマット済み住所
+ *				  ['city']		市区町村
+ *				  ['oaza']		大字
+ *				  ['aza']		字
+ *				  ['detail1']	街区
+ *			FALSE=エラー
+*/
+function getYOLP_Address($latitude, $longitude) {
+	$appid = $this->YAHOO_APPLICATION_ID;
+	$url = "https://map.yahooapis.jp/geoapi/V1/reverseGeoCoder?appid={$appid}&lat={$latitude}&lon={$longitude}&datum=wgs&output=xml";
+	$this->webapi = $url;
+
+	$res = array();
+	$this->unknown_certificate();
+	$xml = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($xml->Error)) {
+		$this->error = TRUE;
+		$this->errmsg = 'Yahoo!リバースジオコーダAPI - ' . $xml->Message;
+		$res = FALSE;
+	} else {
+		$res['address'] = (string)$xml->Feature->Property->Address;
+		foreach ($xml->Feature->Property->AddressElement as $val) {
+			$res[(string)$val->Level] = (string)$val->Name;
+		}
+	}
+
+	return $res;
+}
+
+// Yahoo! JavaScriptマップ描画 ===============================================
+/**
+ * Yahoo! JavaScriptマップを描く
+ * @param	string $id        マップID
+ * @param	float $latitude  中心座標：緯度（世界測地系）
+ * @param	float $longitude 中心座標：経度（世界測地系）
+ * @param	string $type      マップタイプ：NORMAL/PHOTO/B1/OSM
+ *					※注意：マップタイプ変更イベントをキャッチアップできない
+ * @param	int    $zoom      拡大率
+ * @param	string $call      イベント発生時にコールする関数（省略可）
+ * @param	array  $items     地点情報（省略可能）
+ *					string description 情報ウィンドウに表示する内容（HTML文）
+ *					float latitude    緯度
+ *					float longitude   経度
+ *					string icon        アイコンURL
+ * @param	string $call2     追加スクリプト（省略可）
+ * @return	string Yahoo! JavaScriptマップのコード
+*/
+function drawYOLPmap($id, $latitude, $longitude, $type, $zoom, $call=NULL, $items=NULL, $call2=NULL) {
+	$appid = $this->YAHOO_APPLICATION_ID;
+
+	$code =<<< EOD
+<script src="https://map.yahooapis.jp/js/V1/jsapi?appid={$appid}"></script>
+<script>
+window.onload = function() {
+	var ymap = new Y.Map("{$id}", {
+		configure : {
+			doubleClickZoom : true,
+			scrollWheelZoom : true,
+			singleClickPan : true,
+			dragging : true
+		}
+	});
+	var control1 = new Y.LayerSetControl();
+	ymap.addControl(control1);
+	var control2 = new Y.ZoomControl();
+	ymap.addControl(control2);
+	ymap.drawMap(new Y.LatLng($latitude, $longitude), $zoom, Y.LayerSetId.{$type});
+
+    ymap.bind('moveend',  getPointData);
+	ymap.bind('zoomend',  getPointData);
+
+	//イベント発生時の地図情報を取得・格納
+	function getPointData() {
+		var point = ymap.getCenter();
+		//経度
+		if (document.getElementById("longitude") != null) {
+			document.getElementById("longitude").value = point.lng();
+		}
+		//緯度
+		if (document.getElementById("latitude") != null) {
+			document.getElementById("latitude").value = point.lat();
+		}
+		//ズーム
+		if (document.getElementById("zoom") != null) {
+			document.getElementById("zoom").value = ymap.getZoom();
+		}
+		{$call}
+	}
+
+
+EOD;
+	//地点情報
+	if ($items != NULL) {
+		foreach ($items as $i=>$item) {
+			if ($i > 26)	break;		//'Z'を超えたらスキップ
+			//アイコン
+			$mark = $this->num2alpha($i);
+			$icon = isset($item['icon']) ? $item['icon'] : 
+						"http://www.google.com/mapfiles/marker{$mark}.png";
+			$info  = isset($item['description']) ? "marker_{$mark}.bindInfoWindow('{$item['description']}');" : '';
+
+			$code .=<<< EOD
+	var icon_{$mark} = new Y.Icon('{$icon}');
+	var marker_{$mark} = new Y.Marker(new Y.LatLng({$item['latitude']}, {$item['longitude']}), {icon: icon_{$mark}});
+	{$info}
+	ymap.addFeature(marker_{$mark});
+
+EOD;
+		}
+	}
+	//追加関数
+	if ($call2 != NULL) {
+		$code .=<<< EOD
+{$call2}
+
+EOD;
+	}
+	$code .=<<< EOD
+}
+</script>
+
+EOD;
+
+	return $code;
+}
+
+// HeartRails Geo API ========================================================
+/**
+ * HeartRails Geo API - 住所検索APIを用いて住所の緯度・経度を求める
+ * @param	string $query 検索キーワード：住所のみ（UTF-8）
+ * @param	array  $items 情報を格納する配列
+ * @param	string $matching 検索方式
+ *                             prefix = 前方一致
+ *                             like   = 部分一致（省略時）
+ *                             suffix = 後方一致
+ * @return	int ヒットした地点数／(-1)：API呼び出し失敗
+*/
+function getPointsHeartRailsGeo_all($query, &$items, $matching='like') {
+	//リクエストURL
+	$url = "http://geoapi.heartrails.com/api/xml?method=suggest&matching={$matching}&keyword=" . urlencode($query);
+	$this->webapi = $url;
+	$n = 1;
+
+	$this->unknown_certificate();
+	$res = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($res->error)) {
+		$this->error = TRUE;
+		$this->errmsg = (string)$res->error;
+		$n = 0;
+	} else if (! isset($res->location)) {
+		$this->error = TRUE;
+		$this->errmsg = 'Not found';
+		$n = 1;
+	} else {
+		foreach ($res->location as $element) {
+			$items[$n]['latitude']   = (double)$element->y;
+			$items[$n]['longitude']  = (double)$element->x;
+			$items[$n]['prefecture'] = (string)$element->prefecture;
+			$items[$n]['city']       = (string)$element->city;
+			$items[$n]['city_kana']  = (string)$element->{'city-kana'};
+			$items[$n]['town']       = (string)$element->town;
+			$items[$n]['town_kana']  = (string)$element->{'town-kana'};
+			$items[$n]['postal']     = (string)$element->postal;
+			$items[$n]['address']    = (string)$element->prefecture . (string)$element->city . (string)$element->town;
+			$n++;
+		}
+	}
+
+	return ($n - 1);
+}
+
+/**
+ * HeartRails Geo API - 緯度経度による住所検索APIを用いて
+ * 緯度・経度から住所を求める
+ * @param	float $latitude  緯度（世界測地系，10進数の度表記）
+ * @param	float $longitude 経度（世界測地系，10進数の度表記）
+ * @return	array ['address']		フォーマット済み住所
+ *				  ['prefecture']	都道府県名
+ *				  ['city']			市区町村名
+ *				  ['town']			町域名
+ *				  ['postal']		郵便番号
+ *			FALSE=エラー
+*/
+function getHeartRailsGeo_Address($latitude, $longitude) {
+	//リクエストURL
+	$url = "http://geoapi.heartrails.com/api/xml?method=searchByGeoLocation&y={$latitude}&x={$longitude}";
+	$this->webapi = $url;
+
+	$res = array();
+	$this->unknown_certificate();
+	$xml = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($xml->error)) {
+		$this->error = TRUE;
+		$this->errmsg = 'HeartRails Geo API - ' . (string)$xml->error;
+		$res = FALSE;
+	} else if (! isset($xml->location)) {
+		$this->error = TRUE;
+		$this->errmsg = 'HeartRails Geo APIにトラブル発生';
+		$res = FALSE;
+	} else {
+		foreach ($xml->location as $element) {
+			$res['prefecture'] = (string)$element->prefecture;
+			$res['city']       = (string)$element->city;
+			$res['city_kana']  = (string)$element->{'city-kana'};
+			$res['town']       = (string)$element->town;
+			$res['town_kana']  = (string)$element->{'town-kana'};
+			$res['postal']     = (string)$element->postal;
+			$res['address'] = $res['prefecture'] . $res['city'] . $res['town'];
+			break;
+		}
+	}
+
+	return $res;
+}
+
+/**
+ * HeartRails Geo API - 都道府県情報取得API
+ * @param	array  $items 情報を格納する配列
+ * @return	int ヒットした件数
+*/
+function getPrefectures_HeartRailsGeo(&$items) {
+	//リクエストURL
+	$url = 'http://geoapi.heartrails.com/api/xml?method=getPrefectures';
+	$this->webapi = $url;
+	$n = 1;
+
+	$this->unknown_certificate();
+	$res = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($res->error)) {
+		$this->error = TRUE;
+		$this->errmsg = (string)$res->error;
+		$n = FALSE;
+	} else if (! isset($res->prefecture)) {
+		$this->error = TRUE;
+		$this->errmsg = 'Not found';
+		$n = 0;
+	} else {
+		foreach ($res->prefecture as $val) {
+			$items[$n] = (string)$val;
+			$n++;
+		}
+	}
+
+	return ($n - 1);
+}
+
+/**
+ * HeartRails Geo API - 市区町村情報取得API
+ * @param	string $prefecture 都道府県名
+ * @param	array  $items      情報を格納する配列
+ * @return	int ヒットした件数
+*/
+function getCities_HeartRailsGeo($prefecture, &$items) {
+	//リクエストURL
+	$url = "http://geoapi.heartrails.com/api/xml?method=getCities&prefecture={$prefecture}";
+	$this->webapi = $url;
+	$n = 1;
+
+	$this->unknown_certificate();
+	$res = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($res->error)) {
+		$this->error = TRUE;
+		$this->errmsg = (string)$res->error;
+		$n = FALSE;
+	} else if (! isset($res->location)) {
+		$this->error = TRUE;
+		$this->errmsg = 'Not found';
+		$n = 0;
+	} else {
+		foreach ($res->location as $element) {
+			$items[$n]['city']      = (string)$element->city;
+			$items[$n]['city_kana'] = (string)$element->{'city-kana'};
+			$n++;
+		}
+	}
+
+	return ($n - 1);
+}
+
+/**
+ * HeartRails Geo API - 町域情報取得API
+ * @param	string $prefecture 都道府県名
+ * @param	string $city       市区町村名
+ * @param	array  $items      情報を格納する配列
+ * @return	int ヒットした件数
+*/
+function getTowns_HeartRailsGeo($prefecture, $city, &$items) {
+	//リクエストURL
+	$url = "http://geoapi.heartrails.com/api/xml?method=getTowns&prefecture={$prefecture}&city={$city}";
+	$this->webapi = $url;
+	$n = 1;
+
+	$this->unknown_certificate();
+	$res = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($res->error)) {
+		$this->error = TRUE;
+		$this->errmsg = (string)$res->error;
+		$n = FALSE;
+	} else if (! isset($res->location)) {
+		$this->error = TRUE;
+		$this->errmsg = 'Not found';
+		$n = 0;
+	} else {
+		foreach ($res->location as $element) {
+			$items[$n]['city']      = (string)$element->city;
+			$items[$n]['city_kana'] = (string)$element->{'city-kana'};
+			$items[$n]['town']      = (string)$element->town;
+			$items[$n]['town_kana'] = (string)$element->{'town-kana'};
+			$items[$n]['postal']    = (string)$element->postal;
+			$n++;
+		}
+	}
+
+	return ($n - 1);
+}
+
+/**
+ * HeartRails Geo API - 郵便番号による住所検索API
+ * @param	string $postal 郵便番号（7桁の半角数字）
+ * @param	array  $items  情報を格納する配列
+ * @return	int ヒットした地点数
+*/
+function searchByPostal_HeartRailsGeo($postal, &$items) {
+	//リクエストURL
+	$url = "http://geoapi.heartrails.com/api/xml?method=searchByPostal&postal={$postal}";
+	$this->webapi = $url;
+	$n = 1;
+
+	$this->unknown_certificate();
+	$res = simplexml_load_file($url);
+	//レスポンス・チェック
+	if (isset($res->error)) {
+		$this->error = TRUE;
+		$this->errmsg = (string)$res->error;
+		$n = FALSE;
+	} else if (! isset($res->location)) {
+		$this->error = TRUE;
+		$this->errmsg = 'Not found';
+		$n = 0;
+	} else {
+		foreach ($res->location as $element) {
+			$items[$n]['postal']     = $postal;
+			$items[$n]['latitude']   = (double)$element->y;
+			$items[$n]['longitude']  = (double)$element->x;
+			$items[$n]['prefecture'] = (string)$element->prefecture;
+			$items[$n]['city']       = (string)$element->city;
+			$items[$n]['city_kana']  = (string)$element->{'city-kana'};
+			$items[$n]['town']       = (string)$element->town;
+			$items[$n]['town_kana']  = (string)$element->{'town-kana'};
+			$items[$n]['address']    = (string)$element->prefecture . (string)$element->city . (string)$element->town;
+			$n++;
+		}
+	}
+
+	return ($n - 1);
+}
+
+// OSM Nominatim Search API ==================================================
+/**
+ * OSM Nominatim Search API - 住所検索APIを用いて住所の緯度・経度を求める
+ * @param	string $query 検索キーワード：住所のみ（UTF-8）
+ * @param	array  $items 情報を格納する配列
+ * @return	int ヒットした地点数／(-1)：API呼び出し失敗
+*/
+function getPointsNominatim_all($query, &$items) {
+	//リクエストURL
+	$url = 'https://nominatim.openstreetmap.org/search?format=json&q=' . urlencode($query);
+	$this->webapi = $url;
+	$n = 1;
+
+	//User-Agent偽装
+	$header = array(
+		'Content-Type: application/x-www-form-urlencoded',
+		'User-Agent: Mozilla/5.0 (Windows NT 5.1; rv:13.0) Gecko/20100101 Firefox/13.0.1'
+	);
+	$stream = stream_context_create(array(
+		'http' => array(
+			'method' => 'GET',
+			'header' => implode("\r\n", $header),
+			'ignore_errors'=>TRUE
+		)
+	));
+	$json = file_get_contents($url, FALSE, $stream);
+
+	//レスポンス・チェック
+	if ($json == FALSE) {
+		$this->error = TRUE;
+		$this->errmsg = '';
+		$n = 0;
+	} else {
+		if ($this->isphp7over()) {
+			$res = @json_decode($json, FALSE, 512, JSON_BIGINT_AS_STRING);
+		} else {
+			$res = @json_decode($json, FALSE, 512);
+		}
+		foreach ($res as $element) {
+			$items[$n]['latitude']   = (double)$element->lat;
+			$items[$n]['longitude']  = (double)$element->lon;
+			$items[$n]['address']    = (string)$element->display_name;
+			$n++;
+		}
+	}
+	if ($n == 1) {
+		$this->error = TRUE;
+		$this->errmsg = 'Not found';
+	}
+
+	return ($n - 1);
+}
+
+// Leafletによるマップ描画 ===================================================
+/**
+ * Leafletによるマップ描画
+ * @param	string $id        マップID
+ * @param	float  $latitude  中心座標：緯度（世界測地系）
+ * @param	float  $longitude 中心座標：経度（世界測地系）
+ * @param	string $type      マップタイプ：GSISTD/GSIPALE/GSIBLANK/GSIPHOTO/OSM
+ * @param	int    $zoom      拡大率
+ * @param	string $call      イベント発生時にコールする関数（省略可）
+ * @param	array  $items     地点情報（省略可能）
+ *					string description 情報ウィンドウに表示する内容（HTML文）
+ *					float  latitude    緯度
+ *					float  longitude   経度
+ *					string icon        アイコンURL
+ * @param	string $call2     追加スクリプト（省略可）
+ * @param	int    $max_width 情報ウィンドウの最大幅（省略時：200）
+ * @return	string Leafletマップのコード
+*/
+function drawLeaflet($id, $latitude, $longitude, $type, $zoom, $call=NULL, $items=NULL, $call2=NULL, $max_width=200) {
+
+	$code =<<< EOD
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.6.0/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.6.0/dist/leaflet.js"></script>
+<script>
+window.onload = function() {
+	var map = L.map('{$id}',{zoomControl:false});
+	map.setView([{$latitude}, {$longitude}], {$zoom});
+	L.control.scale({
+		maxWidth: 200,
+		position: 'bottomright',
+		imperial: false
+	}).addTo(map);
+	L.control.zoom({position:'topleft'}).addTo(map);
+
+	//地理院地図：標準地図
+	var GSISTD = new L.tileLayer(
+		'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
+		{
+			attribution: "<a href='https://maps.gsi.go.jp/development/ichiran.html' target='_blank'>地理院タイル</a>",
+			minZoom: 0,
+			maxZoom: 18,
+			name: 'GSISTD'
+		});
+	//地理院地図：淡色地図
+	var GSIPALE = new L.tileLayer(
+		'https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png',
+		{
+			attribution: "<a href='https://maps.gsi.go.jp/development/ichiran.html' target='_blank'>地理院タイル</a>",
+			minZoom: 2,
+			maxZoom: 18,
+			name: 'GSIPALE'
+		});
+	//地理院地図：白地図
+	var GSIBLANK = new L.tileLayer(
+		'https://cyberjapandata.gsi.go.jp/xyz/blank/{z}/{x}/{y}.png',
+		{
+			attribution: "<a href='https://maps.gsi.go.jp/development/ichiran.html' target='_blank'>地理院タイル</a>",
+			minZoom: 5,
+			maxZoom: 14,
+			name: 'GSIBLANK'
+		});
+	//地理院地図：写真
+	var GSIPHOTO = new L.tileLayer(
+		'https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg',
+		{
+			attribution: "<a href='https://maps.gsi.go.jp/development/ichiran.html' target='_blank'>地理院タイル</a>",
+			minZoom: 2,
+			maxZoom: 18,
+			name: 'GSIPHOTO'
+		});
+	//OpenStreetMap
+	var OSM = new L.tileLayer(
+		'https://tile.openstreetmap.jp/{z}/{x}/{y}.png',
+		{
+			attribution: "© <a href='https://osm.org/copyright' target='_blank'>OpenStreetMap</a> contributors",
+			minZoom: 0,
+			maxZoom: 18,
+			name: 'OSM'
+		});
+
+	//baseMapsオブジェクトにタイル設定
+	var baseMaps = {
+		"地理院地図" : GSISTD,
+		"淡色地図" : GSIPALE,
+		"白地図" : GSIBLANK,
+		"写真地図" : GSIPHOTO,
+		"オープンストリートマップ" : OSM
+	};
+
+	//layersコントロールにbaseMapsオブジェクトを設定して地図に追加
+	L.control.layers(baseMaps).addTo(map);
+	{$type}.addTo(map);
+
+	//イベント追加
+	map.on('moveend', getPointData);
+	map.on('zoomend', getPointData);
+	map.on('baselayerchange', getPointData);
+
+	//イベント発生時の地図情報を取得・格納
+	function getPointData() {
+		var pos = map.getCenter();
+		//経度
+		if (document.getElementById('longitude') != null) {
+			document.getElementById('longitude').value = pos.lng;
+		}
+		//緯度
+		if (document.getElementById('latitude') != null) {
+			document.getElementById('latitude').value = pos.lat;
+		}
+		//ズーム
+		if (document.getElementById('zoom') != null) {
+			document.getElementById('zoom').value = map.getZoom();
+		}
+		//タイプ
+		if (document.getElementById('type') != null) {
+			for (var k in baseMaps) {
+				if (map.hasLayer(baseMaps[k])) {
+					document.getElementById('type').value = baseMaps[k].options.name;
+				}
+			}
+		}
+		{$call}
+	}
+
+
+EOD;
+	//地点情報
+	if ($items != NULL) {
+		foreach ($items as $i=>$item) {
+			if ($i > 26)	break;		//'Z'を超えたらスキップ
+			//アイコン
+			$mark = $this->num2alpha($i);
+			$icon = isset($item['icon']) ? $item['icon'] : 
+						"http://www.google.com/mapfiles/marker{$mark}.png";
+			list($icon_width, $icon_height) = getimagesize($icon);
+			$offx = round($icon_width / 2);
+			$offy = $icon_height;
+			$info  = isset($item['description']) ? "marker_{$mark}.bindPopup('{$item['description']}', {maxWidth: {$max_width}});" : '';
+
+			$code .=<<< EOD
+	var icon_{$mark} = new L.icon({
+		iconUrl: '{$icon}',
+		iconAnchor: [{$offx}, {$offy}]
+	});
+	var marker_{$mark} = new L.Marker([{$item['latitude']}, {$item['longitude']}], {icon: icon_{$mark}}).addTo(map);
+	{$info}
+
+EOD;
+		}
+	}
+	//追加関数
+	if ($call2 != NULL) {
+		$code .=<<< EOD
+{$call2}
+
+EOD;
+	}
+	$code .=<<< EOD
+}
+</script>
+
+EOD;
+
+	return $code;
+}
+
+/**
+ * 直線描画スクリプト：Leaflet用
+ * @param	array  $points  直線の座標配列
+ *						[$n]['longitude'] 経度（世界測地系）
+ *						[$n]['latitude']  緯度（世界測地系）
+ * @param	string $color   描画色（省略時=#FF0000）
+ * @param	float  $opacity 透明度（省略時=1）
+ * @param	int    $weight  線の太さ（省略時=1）
+ * @return	string JavaScript
+*/
+function jsLine_Leaflet($points, $color='#FF0000', $opacity='1.0', $weight=1) {
+	$ss = '';
+	$cnt = 0;
+	foreach ($points as $pt) {
+		if ($cnt > 0)	$ss .= ', ';
+		$ss .= "[{$pt['latitude']}, {$pt['longitude']}]";
+		$cnt++;
+	}
+
+	$js =<<< EOT
+	L.polyline(
+		[{$ss}], {
+		'color':  '{$color}',
+		'opacity': {$opacity},
+		'weight':  {$weight}
+	}).addTo(map);
+
+EOT;
+	return $js;
+}
+
+// 地図サービス（共通） ======================================================
+/**
+ * ジオコーダAPI名を取得
+ *
+ * @param	int $api ジオコーダー番号
+ * @return	string ジオコーダーAPI名／FALSE：不明
+*/
+function getGeoCoderName($api) {
+	static $tbl = array(
+		0=>'Google',
+		1=>'Yahoo!JAPAN',
+		11=>'HeartRails Geo API',
+		12=>'OSM Nominatim Search API'
+	);
+
+	$res = FALSE;
+	foreach ($tbl as $key=>$val) {
+		if ($key == $api) {
+			$res = $val;
+			break;
+		}
+	}
+
+	return $res;
+}
+
+/**
+ * ジオコーダAPI を用いて住所・ランドマークの緯度・経度を検索
+ *
+ * @param	string $query 検索キーワード（UTF-8）
+ * @param	int    $api    0：Google Geocoding API（省略時）
+ *                         1：Yahoo!ジオコーダAPI
+ *                        11：HeartRails Geo API
+ *                        12：OSM Nominatim Search API
+ * @param	string $category 検索対象カテゴリ（YOLPのみ必要）
+ *                           address  = 住所（省略時）
+ *                           landmark = ランドマーク
+ *                           world    = 世界
+ * @return	array(int ヒットした地点数,string WebAPI)
+*/
+function searchPoint3($query, $api=0, $category='address') {
+	static $pat1 = '/E(\d+\.?\d*)N(\d+\.?\d*)/i';
+	static $pat2 = '/E(\d+)\.(\d+)\.(\d+)\.(\d+)N(\d+)\.(\d+)\.(\d+)\.(\d+)/i';
+
+	unset($this->items);
+	$this->items = array();
+	$this->hits = 0;
+
+	//緯度・経度表記(1)
+	if (preg_match($pat1, $query) > 0) {
+		list($this->items[1]['latitude'], $this->items[1]['longitude']) =
+			$this->parse_geo($query);
+		$this->items[1]['address'] = '';
+		$this->hits = 1;
+
+	//緯度・経度表記(2)
+	} else if (preg_match($pat2, $query) > 0) {
+		list($this->items[1]['latitude'], $this->items[1]['longitude']) =
+			$this->parse_geo($query);
+		$this->items[1]['address'] = '';
+		$this->hits = 1;
+
+	//Google Geocoding API使用
+	} else if ($api == 0) {
+		$n = $this->getPointsV3_all($query, $this->items);
+		if ($n == (-1)) {	//v.5.73修正
+			$this->error  = TRUE;
+			$this->errmsg = 'Google Geocoding APIにトラブル発生';
+			$this->hits = 0;
+		} else if ($n == 0) {
+			$this->error  = TRUE;
+			$this->errmsg = '指定キーワードでは検索できない';
+			$this->hits = 0;
+		} else {
+			$this->hits = $n;
+		}
+
+	//Yahoo!ジオコーダAPI使用
+	} else if ($api == 1) {
+		$n = $this->getPointsYOLP_all($query, $this->items, $category);
+		if ($n == (-1)) {	//v.5.73修正
+			$this->error  = TRUE;
+			$this->errmsg = 'Yahoo!ジオコーダAPIにトラブル発生';
+			$this->hits = 0;
+		} else if ($n == 0) {
+			$this->error  = TRUE;
+			$this->errmsg = '指定キーワードでは検索できない';
+			$this->hits = 0;
+		} else {
+			$this->hits = $n;
+		}
+
+	//HeartRails Geo API使用
+	} else if ($api == 11) {
+		$n = $this->getPointsHeartRailsGeo_all($query, $this->items, 'like');
+		if ($n == (-1)) {	//v.5.73修正
+			$this->hits = 0;
+		} else if ($n == 0) {
+			$this->errmsg = '指定キーワードでは検索できない';
+			$this->hits = 0;
+		} else {
+			$this->hits = $n;
+		}
+
+	//OSM Nominatim Search API使用
+	} else if ($api == 12) {
+		$n = $this->getPointsNominatim_all($query, $this->items);
+		if ($n == (-1)) {
+			$this->errmsg = 'OSM Nominatim Search APIにトラブル発生';
+			$this->hits = 0;
+		} else if ($n == 0) {
+			$this->errmsg = '指定キーワードでは検索できない';
+			$this->hits = 0;
+		} else {
+			$this->hits = $n;
+		}
+
+	//エラー
+	} else {
+		$this->error  = TRUE;
+		$this->errmsg = 'ジオコーダーAPIの指定間違い';
+		$this->hits = 0;
+	}
+
+	return array($this->hits, $this->webapi);
+}
+
+/**
+ * 逆ジオコーダAPI名を取得
+ *
+ * @param	int $api 逆ジオコーダー番号
+ * @return	string 逆ジオコーダーAPI名／FALSE：不明
+*/
+function getRevGeoCoderName($api) {
+	static $tbl = array(
+		0=>'Google Geocoding API',
+		1=>'Yahoo!リバースジオコーダAPI',
+		11=>'HeartRails Geo API',
+		21=>'簡易逆ジオコーディングサービス'
+	);
+
+	$res = FALSE;
+	foreach ($tbl as $key=>$val) {
+		if ($key == $api) {
+			$res = $val;
+			break;
+		}
+	}
+
+	return $res;
+}
+
+/**
+ * 緯度・経度から住所を求める
+ *
+ * @param	float  $latitude  緯度（世界測地系，10進数の度表記）
+ * @param	float  $longitude 経度（世界測地系，10進数の度表記）
+ * @param	int    $api    0：Google Geocoding API
+ *                         1：Yahoo!リバースジオコーダAPI
+ *                        11：HeartRails Geo API
+ *                        21：簡易ジオコーディングサービス（省略時）
+ * @return	array ['address']		フォーマット済み住所
+ * 				  ['postalcode']	郵便番号（一部サービスのみ）
+ * 				  ['prefecture']	都道府県名
+ * 				  ['city']			市町村名
+ * 				  ['local']			市町村名以下
+ *			FALSE=エラー
+*/
+function getAddress3($latitude, $longitude, $api=21) {
+	$this->hits = 1;
+	$ret = array();
+	switch ($api) {
+		//Google Geocoding API
+		case 0:
+			$res = $this->getGoogleAddress($latitude, $longitude);
+			if ($res == FALSE) {
+				$ret = FALSE;
+				$this->error  = TRUE;
+				$this->errmsg = 'Google Geocoding API にトラブル発生';
+				$this->hits = 0;
+			} else {
+				$ret['address' ]   = $res['address'];
+				$ret['postalcode'] = preg_replace('/\-/', '', $res['postal_code']);
+				$ret['prefecture'] = $res['administrative_area_level_1'];
+				$ret['city']       = $res['locality'];
+				$pat = '/' . $ret['prefecture'] . $ret['city'] . '(.+)$/ui';
+				$ret['local'] = (preg_match($pat, $ret['address'], $arr) > 0) ?
+					$arr[1] : '';
+			}
+			break;
+		//Yahoo!リバースジオコーダAPI
+		case 1:
+			$res = $this->getYOLP_Address($latitude, $longitude);
+			if ($res == FALSE) {
+				$ret = FALSE;
+				$this->hits = 0;
+			} else {
+				$ret['address' ]   = isset($res['address']) ? $res['address'] : '';
+				$ret['postalcode'] = '';
+				$ret['prefecture'] = isset($res['prefecture']) ? $res['prefecture'] : '';
+				$ret['city']       = isset($res['city']) ? $res['city'] : '';
+				$pat = '/' . $ret['prefecture'] . $ret['city'] . '(.+)$/ui';
+				$ret['local'] = (preg_match($pat, $ret['address'], $arr) > 0) ?
+					$arr[1] : '';
+			}
+			break;
+		//HeartRails Geo API
+		case 11:
+			$res = $this->getHeartRailsGeo_Address($latitude, $longitude);
+			if ($res == FALSE) {
+				$ret = FALSE;
+				$this->hits = 0;
+			} else {
+				$ret['address' ]   = isset($res['address']) ? $res['address'] : '';
+				$ret['postalcode'] = isset($res['postal']) ? $res['postal'] : '';
+				$ret['prefecture'] = isset($res['prefecture']) ? $res['prefecture'] : '';
+				$ret['city']       = isset($res['city']) ? $res['city'] : '';
+				$pat = '/' . $ret['prefecture'] . $ret['city'] . '(.+)$/ui';
+				$ret['local'] = (preg_match($pat, $ret['address'], $arr) > 0) ?
+					$arr[1] : '';
+			}
+			break;
+		//簡易逆ジオコーディングサービス
+		case 21:
+			$arr = $this->getAddress($latitude, $longitude);
+			if ($arr == FALSE) {
+				$ret = FALSE;
+				$this->hits = 0;
+			} else {
+				$ret['address']  = $arr[0] . $arr[1] . $arr[2] . $arr[3];
+				$ret['postalcode'] = '';
+				$ret['prefecture'] = $arr[0];
+				$ret['city'] = $arr[1];
+				$ret['local'] = $arr[2] . $arr[3];
+			}
+			break;
+		//エラー
+		default:
+			$ret = FALSE;
+			$this->error  = TRUE;
+			$this->errmsg = '逆ジオコーダーAPIの指定ミス';
+			$this->hits = 0;
+			break;
+	}
+
+	return $ret;
+}
+
+/**
+ * 地図サービス名を取得
+ *
+ * @param	int $api 地図サービス番号
+ * @return	string 地図サービス名／FALSE：不明
+*/
+function getMapServiceName($api) {
+	static $tbl = array(
+		0=>'Google',
+		1=>'Yahoo!JAPAN',
+		2=>'地理院地図・OSM'
+	);
+
+	$res = FALSE;
+	foreach ($tbl as $key=>$val) {
+		if ($key == $api) {
+			$res = $val;
+			break;
+		}
+	}
+
+	return $res;
+}
+
+/**
+ * 地図サービスを利用してJavaScriptマップを描く
+ *
+ * @param	string $id        マップID
+ * @param	float  $latitude  中心座標：緯度（世界測地系）
+ * @param	float  $longitude 中心座標：経度（世界測地系）
+ * @param	string $type      マップタイプ
+ *								Googleの場合　HYBRID/ROADMAP/SATELLITE/TERRAIN
+ *								Yahoo!JAPANの場合　NORMAL/PHOTO/B1/OSM
+ * @param	int    $zoom      拡大率
+ * @param	string $call      イベント発生時にコールする関数（省略可）
+ * @param	array  $items     地点情報（省略可能）
+ *					string title       タイトル（Yahoo!では無効）
+ *					string description 情報ウィンドウに表示する内容（HTML文）
+ *					float latitude    緯度
+ *					float longitude   経度
+ *					string icon        アイコンURL
+ * @param	string $api   0：Google Maps JavaScript（省略時）
+ *                        1：Yahoo! JavaScriptマップ
+ *                        2：地理院地図・OSM（Leaflet使用）
+ * @param	string $call2 追加スクリプト（省略可）
+ * @param	int    $max_width 情報ウィンドウの最大幅（省略時：200）
+ * @return	string JavaScriptマップのコード
+*/
+function drawJSmap($id, $latitude, $longitude, $type, $zoom, $call=NULL, $items=NULL, $api=0, $call2=NULL, $max_width=200) {
+	//マップタイプの読み替え
+	static $tbl1 = array('HYBRID'=>'PHOTO', 'ROADMAP'=>'NORMAL', 'SATELLITE'=>'PHOTO', 'TERRAIN'=>'PHOTO');
+	static $tbl2 = array('NORMAL'=>'ROADMAP', 'PHOTO'=>'SATELLITE', 'B1'=>'ROADMAP', 'OSM'=>'ROADMAP');
+	static $tbl3 = array('HYBRID'=>'GSISTD', 'ROADMAP'=>'OSM', 'SATELLITE'=>'GSIPHOTO', 'TERRAIN'=>'GSIPHOTO');
+	$type = strtoupper($type);
+
+	switch ($api) {
+	//Google Maps JavaScript
+	case 0;
+		$type = isset($tbl2[$type]) ? $tbl2[$type] : $type;
+		$js = $this->drawGMap($id, $latitude, $longitude, $type, $zoom, $call, $items, $call2, $max_width);
+		break;
+	//Yahoo! JavaScriptマップ
+	case 1:
+		$type = isset($tbl1[$type]) ? $tbl1[$type] : $type;
+		$js = $this->drawYOLPmap($id, $latitude, $longitude, $type, $zoom, $call, $items, $call2);
+		break;
+	//地理院地図・OSM（Leaflet使用）
+	case 2:
+		$type = isset($tbl3[$type]) ? $tbl3[$type] : $type;
+		$js = $this->drawLeaflet($id, $latitude, $longitude, $type, $zoom, $call, $items, $call2, $max_width);
+		break;
+	}
+
+	return $js;
+}
+
