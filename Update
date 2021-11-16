@@ -1,0 +1,493 @@
+<?php
+/** myWeather.php
+ * 地図で指定した場所の天気予報
+ *
+ * @copyright	(c)studio pahoo
+ * @author		パパぱふぅ
+ * @動作環境	PHP 5/7/8
+ * @参考URL		https://www.pahoo.org/e-soul/webtech/php06/php06-52-01.shtm
+ *
+ * ■URLパラメータ指定
+ * myWeather.php?query=%E6%9C%AD%E5%B9%8C%E5%B8%82&exec=
+ *   キーワードを使って検索した場所の天気予報を表示する
+ *   query  検索キーワード（UTF-8）（例）札幌市
+ *   exec   キーワード検索ボタンの代替
+ *
+ * myWeather.php?query=%E6%9C%AD%E5%B9%8C%E5%B8%82&id=1
+ *   キーワードを使って検索した場所の天気予報を表示する（予報表のみ，CSS無し）
+ *   query  検索キーワード（UTF-8）（例）札幌市
+ *   id     1なら予報表のみを表示（CSSなし）
+ *
+ * myWeather.php?query=%E6%9C%AD%E5%B9%8C%E5%B8%82&id=2
+ *   キーワードを使って検索した場所の天気予報を表示する（予報表のみ，CSS有り）
+ *   query  検索キーワード（UTF-8）（例）札幌市
+ *   id     2なら予報表のみを表示（CSSあり）
+ *
+ * myWeather.php?latitude=26.591535&longitude=127.9773714&id=1
+ *   緯度・経度で指定した場所の天気予報を表示する（予報表のみ，CSS無し）
+ *   latitude   緯度
+ *   longitude  経度
+ *   id         2なら予報表のみを表示（CSSあり）
+*/
+// 初期化処理 ================================================================
+define('INTERNAL_ENCODING', 'UTF-8');
+mb_internal_encoding(INTERNAL_ENCODING);
+mb_regex_encoding(INTERNAL_ENCODING);
+define('MYSELF', basename($_SERVER['SCRIPT_NAME']));
+define('REFERENCE', 'https://www.pahoo.org/e-soul/webtech/php06/php06-52-01.shtm');
+
+//プログラム・タイトル
+define('TITLE', '地図で指定した場所の天気予報');
+
+if (isset($_SERVER['HTTP_HOST']) && ($_SERVER['HTTP_HOST'] == 'localhost')) {
+	define('FLAG_RELEASE', FALSE);
+	define('REFER_ON', '');
+} else {
+	//リリース・フラグ（公開時にはTRUEにすること）
+	define('FLAG_RELEASE', TRUE);
+	//リファラ・チェック（直リン防止用；空文字ならチェックしない）
+	define('REFER_ON', 'www.pahoo.org');
+}
+
+//地図描画サービスの選択
+//    0：Google
+//    2：地理院地図・OSM
+define('MAPSERVICE', 2);
+
+//住所検索サービスの選択
+//    0：Google
+//    1：Yahoo!JAPAN
+//   11：HeartRails Geo API
+//   12：OSM Nominatim Search API
+define('GEOSERVICE', 1);
+
+//逆ジオコーディングサービスの選択
+//    0：Google
+//    1：Yahoo!JAPAN
+//   11：HeartRails Geo API
+//   21：簡易ジオコーディングサービス
+define('REVGEOSERVICE', 21);
+
+//マップの表示サイズ（単位：ピクセル）
+define('MAP_WIDTH',  700);
+define('MAP_HEIGHT', 400);
+//マップID
+define('MAPID', 'map_id');
+//初期値
+define('DEF_LATITUDE',  35.4658);		//緯度
+define('DEF_LONGITUDE', 139.6223);		//経度
+define('DEF_TYPE',		'roadmap');		//マップタイプ
+define('DEF_ZOOM',		13);			//ズーム
+define('DEF_CATEGORY', 'address');		//カテゴリ
+
+//キャッシュ保持時間（分） 0：キャッシュしない
+//気象庁へのアクセス負荷軽減のため，60分以上のキャッシュ保持をお勧めします．
+define('LIFE_CACHE', 120);
+
+//キャッシュ・ディレクトリ
+//書き込み可能で，外部からアクセスされないディレクトリを指定してください．
+//最大150Mバイトを消費します．天気予報系プログラムは同じディレクトリで構わない．
+define('DIR_CACHE', './pcache/');
+
+//住所・緯度・経度に関わるクラス：include_pathが通ったディレクトリに配置
+require_once('pahooGeoCode.php');
+
+//気象情報クラス：include_pathが通ったディレクトリに配置
+require_once('pahooWeather.php');
+
+//キャッシュ処理に関わるクラス：include_pathが通ったディレクトリに配置
+require_once('pahooCache.php');
+
+/**
+ * 共通HTMLヘッダ
+ * @global string $HtmlHeader
+*/
+$encode = INTERNAL_ENCODING;
+$title  = TITLE;
+$width  = MAP_WIDTH;
+$HtmlHeader =<<< EOT
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="{$encode}">
+<title>{$title}</title>
+<meta name="author" content="studio pahoo" />
+<meta name="copyright" content="studio pahoo" />
+<meta name="ROBOTS" content="NOINDEX,NOFOLLOW" />
+<meta http-equiv="pragma" content="no-cache">
+<meta http-equiv="cache-control" content="no-cache">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<style>
+/* エラー表示 */
+p.werror {
+	color: red;
+}
+/* 天気予報表 */
+table.weather {
+	width: {$width}px;
+	border:solid 1px #000000;
+	border-collapse:collapse;
+	margin-top:10px;
+
+}
+/* 天気予報表：月日表示部 */
+table.weather td.dt {
+	width: {$width}px;
+	border:solid 1px #000000;
+	border-collapse: collapse;
+	padding:4px;
+	white-space:nowrap;
+	text-align:center;
+}
+/* 天気予報表：予報表示部 */
+table.weather td.info {
+	width: {$width}px;
+	border:solid 1px #000000;
+	border-collapse: collapse;
+	padding:4px;
+	white-space:nowrap;
+	text-align:center;
+}
+/* 天気予報表：予報アイコン */
+img.wicon {
+	width: 60px;
+}
+/* 天気予報表：小さい文字 */
+span.wsmall {
+	font-size: small;
+}
+</style>
+</head>
+
+EOT;
+
+/**
+ * 共通HTMLフッタ
+ * @global string $HtmlFooter
+*/
+$HtmlFooter =<<< EOT
+</html>
+
+EOT;
+
+// サブルーチン ==============================================================
+/**
+ * エラー処理ハンドラ
+*/
+function myErrorHandler ($errno, $errmsg, $filename, $linenum) {
+	echo "Sory, system error occured !";
+	exit(1);
+}
+error_reporting(E_ALL);
+if (FLAG_RELEASE)	$old_error_handler = set_error_handler('myErrorHandler');
+
+//PHP5判定
+if (! isphp5over()) {
+	echo 'Error > Please let me run on PHP5 or more...';
+	exit(1);
+}
+
+//リファラ・チェック
+if (REFER_ON != '') {
+	if (isset($_SERVER['HTTP_REFERER'])) {
+		$url = parse_url($_SERVER['HTTP_REFERER']);
+		$res = ($url['host'] == REFER_ON) ? TRUE : FALSE;
+	} else {
+		$res = FALSE;
+	}
+} else {
+	$res = TRUE;
+}
+if (! $res) {
+	echo 'Please refer to ' . REFER_ON . ' !';
+	exit(1);
+}
+
+/**
+ * PHP5以上かどうか検査する
+ * @return	bool TRUE：PHP5以上／FALSE:PHP5未満
+*/
+function isphp5over() {
+	$version = explode('.', phpversion());
+
+	return $version[0] >= 5 ? TRUE : FALSE;
+}
+
+/**
+ * 指定したボタンが押されてきたかどうか
+ * @param	string $btn  ボタン名
+ * @return	bool TRUE＝押された／FALSE＝押されていない
+*/
+function isButton($btn) {
+	if (isset($_GET[$btn]))		return TRUE;
+	if (isset($_POST[$btn]))	return TRUE;
+	return FALSE;
+}
+
+/**
+ * 指定したパラメータを取り出す
+ * @param	string $key  パラメータ名（省略不可）
+ * @param	bool   $auto TRUE＝自動コード変換あり／FALSE＝なし（省略時：TRUE）
+ * @param	mixed  $def  初期値（省略時：空文字）
+ * @return	string パラメータ／NULL＝パラメータ無し
+*/
+function getParam($key, $auto=TRUE, $def='') {
+	if (isset($_GET[$key]))			$param = $_GET[$key];
+	else if (isset($_POST[$key]))	$param = $_POST[$key];
+	else							$param = $def;
+	if ($auto)	$param = mb_convert_encoding($param, INTERNAL_ENCODING, 'auto');
+	return $param;
+}
+
+/**
+ * 週間天気予報表を作成する
+ * @param	string $address 住所
+ * @param	array  $items   週間天気予報を格納した配列
+ * @param	int    $start   作成開始オフセット（0～6）
+ * @param	int    $goal    作成終了オフセット（0～6）
+ * @return	int 配列に格納した情報件数/0=失敗
+*/
+function makeWeeklyWeather($address, $items, $start, $goal) {
+	//引数のベリファイ
+	if ($start < 0 || $start > 6)	return FALSE;
+	if ($goal  < 0 || $goal  > 6)	return FALSE;
+	if ($start > $goal)				return FALSE;
+
+	$outstr =<<< EOT
+<table class="weather">
+<caption>{$address} の天気予報</caption>
+<tr>
+
+EOT;
+
+	for ($i = $start; $i <= $goal; $i++) {
+		$mmddww = sprintf("%02d/%02d(%s)", $items[$i]['month'], $items[$i]['day'], $items[$i]['week']);
+		$outstr .=<<< EOT
+<td class="dt">{$mmddww}</td>
+
+EOT;
+	}
+	$outstr .=<<< EOT
+</tr>
+<tr>
+
+EOT;
+	for ($i = $start; $i <= $goal; $i++) {
+		$mmddww = sprintf("%02d/%02d(%s)", $items[$i]['month'], $items[$i]['day'], $items[$i]['week']);
+		$temp_max = ((string)$items[$i]['temp_max'] != '') ? $items[$i]['temp_max'] . '℃' : '-';
+		$temp_min = ((string)$items[$i]['temp_min'] != '') ? $items[$i]['temp_min'] . '℃' : '-';
+		$outstr .=<<< EOT
+<td class="info">
+{$items[$i]['weather']}<br />
+<img class="wicon" src="{$items[$i]['image']}" /><br />
+<span class="wsmall">
+{$items[$i]['rainy']}％<br />
+{$items[$i]['temp_max']}℃/{$items[$i]['temp_min']}℃
+</span>
+</td>
+
+EOT;
+	}
+	$outstr .=<<< EOT
+</tr>
+</table>
+
+EOT;
+
+	return $outstr;
+}
+
+/**
+ * HTML BODYを作成する
+ * @param	int    $id     表示モード
+ *			0：全部表示，1:予報表のみ（CSSなし），2：予報表のみ（CSSあり）
+ * @param	string $html   週間天気予報表
+ * @param	string $jsmap  マップ描画用HTML
+ * @param	array  $spot   地図情報
+ * @param   object $pgc    pahooGeoCodeクラス
+ * @param   object $pwt    pahooWeatherクラス
+ * @return	string HTML BODY
+*/
+function makeCommonBody($id, $html, $jsmap, $spot, $pgc, $pwt) {
+	$myself = MYSELF;
+	$refere = REFERENCE;
+	$mapid  = MAPID;
+	$width  = MAP_WIDTH;
+	$height = MAP_HEIGHT;
+	$title  = TITLE;
+	$version = '<span style="font-size:small;">' . date('Y/m/d版', filemtime(__FILE__)) . '</span>';
+
+	//カテゴリ選択ラジオボタン
+	$str_radio = (GEOSERVICE == 1) ? '<br />カテゴリ　' . $pgc->makeYOLP_GeoSelectCategory('category') . '<br />' : '';
+
+	//ヘルプ記事
+	$help1 = (GEOSERVICE <= 1) ? 'ランドマーク，' : '';
+	$help2 = (GEOSERVICE == 1) ? '<li>［<span style="font-weight:bold;">カテゴリ</span>］を選択してください．</li>' : '';
+
+	//デバッグ情報
+	if (! FLAG_RELEASE) {
+		$phpver = phpversion();
+		$debug =<<< EOT
+<p>
+<span style="font-weight:bold;">★デバックモードで動作中...</span><br />
+PHPver : {$phpver}<br />
+WebAPI : <a href="{$pgc->webapi}" target="_blank">{$pgc->webapi}</a><br />
+feed   : <a href="{$pwt->xmlfile[0]}" target="_blank">{$pwt->xmlfile[0]}</a><br />
+weekly : <a href="{$pwt->xmlfile[1]}" target="_blank">{$pwt->xmlfile[1]}</a><br />
+daily  : <a href="{$pwt->xmlfile[2]}" target="_blank">{$pwt->xmlfile[2]}</a>
+</p>
+
+EOT;
+	} else {
+		$debug = '';
+	}
+
+	//検索結果
+	if ($pgc->errmsg != '') {
+		$res =<<< EOT
+<p style="color:red">
+エラー：{$pgc->errmsg}．
+</p>
+
+EOT;
+	} else {
+		$res = $html;
+	}
+
+	if ($id == 0) {
+		$html =<<< EOT
+<body>
+{$jsmap}
+<h2>{$title} {$version}</h2>
+<form name="myform" method="get" action="{$myself}" enctype="multipart/form-data">
+検索キー　<input type="text" name="query" size="28" value="{$spot['query']}" />
+<input type="submit" id="exec"  name="exec"  value="キーワード検索" />&nbsp;
+<input type="submit" id="map"   name="map"   value="地図検索" />&nbsp;
+<input type="submit" id="clear" name="clear" value="リセット" />
+{$str_radio}
+<input type="hidden" id="latitude"  name="latitude"  value="{$spot['latitude']}" />
+<input type="hidden" id="longitude" name="longitude" value="{$spot['longitude']}" />
+<input type="hidden" id="zoom"      name="zoom"      value="{$spot['zoom']}" />
+</form>
+<div id="{$mapid}" style="width:{$width}px; height:{$height}px; margin:20px 0px 20px 0px;"></div>
+{$res}
+
+<div style="border-style:solid; border-width:1px; margin:20px 0px 0px 0px; padding:5px; width:{$width}px; font-size:small; overflow-wrap:break-word; word-break:break-all;">
+<h3>使い方</h3>
+<ol>
+<li>［<span style="font-weight:bold;">検索キー</span>］に住所，{$help1}緯度経度のいずれかを入力してください．<br />
+緯度経度は E139.45.56.9N35.41.0.7（東経139度45分56.9秒，北緯35度41分0.7秒），または E139.76N35.68（東経139.76度，北緯35.68度）のように入力してください．</li>
+{$help2}
+<li>［<span style="font-weight:bold;">キーワード検索</span>］ ボタンを押してください．</li>
+<li>最寄の地域の週間天気予報を表示します．</li>
+<li>地図上を移動し，［<span style="font-weight:bold;">地図検索</span>］ ボタンを押すと、最寄の地域の天気予報を表示します．時間帯によっては予報情報が未配信のことがあります．</li>
+<li>［<span style="font-weight:bold;">リセット</span>］ ボタンを押すと，初期化します．</li>
+<li>今日・明日の降水確率は，予報地点に近い場所の値を採用する場合があります．<br />データ更新のタイミングによって，気象庁サイトの天気予報とずれることがあります．あらかじめご了承ください．</li>
+</ol>
+※参考サイト：<a href="{$refere}">{$refere}</a><br />
+※出典：<a href="http://xml.kishou.go.jp/index.html">気象庁防災情報XMLフォーマット情報提供ページ</a>
+{$debug}
+</div>
+</body>
+
+EOT;
+	} else {
+		$html =<<< EOT
+<body>
+{$res}
+</body>
+
+EOT;
+	}
+
+	return $html;
+}
+
+// メイン・プログラム =======================================================
+//オブジェクト生成
+$pcc = new pahooCache(LIFE_CACHE, DIR_CACHE);
+$pwt = new pahooWeather($pcc);
+$pgc = new pahooGeoCode();
+
+//パラメータ
+$id        = (int)getParam('id',          FALSE, 0);				//表示モード
+$query     = (string)getParam('query',    TRUE,  '');				//地図検索キー
+$latitude  = (float)getParam('latitude',  FALSE, DEF_LATITUDE);		//緯度
+$longitude = (float)getParam('longitude', FALSE, DEF_LONGITUDE);	//経度
+$zoom      = (int)getParam('zoom',      FALSE, DEF_ZOOM);			//ズーム
+$type      = (string)getParam('type',     FALSE, DEF_TYPE);			//マップタイプ
+$category  = (string)getParam('category',    FALSE, DEF_CATEGORY);	//カテゴリ
+$outenc    = (string)getParam('charset',  FALSE, INTERNAL_ENCODING);
+$pgc->setYOLP_GeoSelectCategory($category);
+$items  = array();
+$errmsg = $url = $address = '';
+
+//検索キーをクリア
+if (isButton('clear')) {
+	$id = 0;
+	$query = '';
+	$longitude = DEF_LONGITUDE;
+	$latitude  = DEF_LATITUDE;
+	$zoom      = DEF_ZOOM;
+	$type      = DEF_TYPE;
+	$category  = DEF_CATEGORY;
+	$outenc    = INTERNAL_ENCODING;
+
+//緯度・経度を取得
+} else if (! isButton('map') && ($query != '')) {
+	list($n, $url) = $pgc->searchPoint3($query, GEOSERVICE, $category);
+	//エラーがなければ最初の住所を対象にする
+	if (! $pgc->iserror()) {
+		list($latitude, $longitude, $address) = $pgc->getPoint(1);
+	} else {
+		$errmsg = $pgc->geterror();
+	}
+}
+
+$items['stationName'] = '';
+
+//最も近い予報地点を探す
+$station = $pwt->getJmaNearSpot($pgc, $longitude, $latitude, 1);
+
+//天気予報情報の取得
+$pwt->jmaGetWeatherForecast($items, $station, 1);
+
+//緯度・経度から住所を取得
+if (($query == '') || (preg_match('/[EWNS0-9\.\-\+]+/i', $query) > 0)) {
+	$arr = $pgc->getAddress3($latitude, $longitude, REVGEOSERVICE);
+	$query = ($arr == FALSE) ? $items['stationName'] : $arr['address'];
+	$address = $query;
+}
+
+//マップ作成
+$jsmap = $pgc->drawJSMap(MAPID, $latitude, $longitude, $type, $zoom, NULL, NULL, MAPSERVICE);
+
+$cnt  = count($items);
+$html = (count($items) == 0) ? '' : makeWeeklyWeather($address, $items, 0, 6);
+
+//場所情報を配列へ
+$spot['query']     = $query;
+$spot['longitude'] = $longitude;
+$spot['latitude']  = $latitude;
+$spot['address']   = $address;
+$spot['zoom']      = $zoom;
+$spot['type']      = $type;
+$spot['category']  = $category;
+
+$HtmlBody = makeCommonBody($id, $html, $jsmap, $spot, $pgc, $pwt);
+
+//表示処理
+if ($id != 1) {
+	echo $HtmlHeader;
+	echo $HtmlBody;
+	echo $HtmlFooter;
+} else {
+	echo mb_convert_encoding($html, $outenc, INTERNAL_ENCODING);
+}
+
+//オブジェクト解放
+$pgc = NULL;
+$pwt = NULL;
+$pcc = NULL;
+
+/*
